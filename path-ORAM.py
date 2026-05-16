@@ -1,107 +1,328 @@
+from __future__ import annotations
+from collections import Counter
+import random
+from typing import Optional
+import copy
+
+
+random.seed(542)
+
+
+ROOT_KEY: str = "root"
+
 
 class ORAMtree:
-    def __init__(self, L, Z):
-        self.L = L
-        self.tree = {}
+    def __init__(self, L: int, Z: int) -> None:
+        self.L: int = L
+        self.Z: int = Z
+        self.tree: dict[str, bucket] = {}
+        self.leaflog: list[str] = list()
+        self.bucketlog: list[str] = list()
 
         for h in range(self.L + 1):
-
             for i in range(2**h):
-
                 if h == 0:
-                    key = ""
+                    key: str = ROOT_KEY
                 else:
                     key = format(i, f"0{h}b")
 
-                b = bucket(Z)
-                b.generate_dummy()
-
+                b: bucket = bucket(Z)
                 self.tree[key] = b
 
-    def __repr__(self):
-
-        out = []
+    def __repr__(self) -> str:
+        out: list[str] = []
 
         for h in range(self.L + 1):
-
             out.append(f"Level {h}")
 
             for i in range(2**h):
-
                 if h == 0:
-                    key = ""
+                    key: str = ROOT_KEY
                 else:
                     key = format(i, f"0{h}b")
 
                 out.append(f"  [{key}] {self.tree[key]}")
 
         return "\n".join(out)
-    
-    def read_bucket(self, leaf, h):
-        key = leaf[:h]
+
+    def read_bucket(self, leaf: str, h: int) -> bucket:
+        if h == 0:
+            key: str = ROOT_KEY
+        else:
+            key = leaf[:h]
+        
+        self.bucketlog.append(key)
+
         return self.tree[key]
-    
-    def read_path(self,leaf):
-        datablocks = list()
-        for i in range(self.L+1):
-            for j in self.read_bucket(leaf,i):
-                datablocks.append(j)
+
+    def read_path(self, leaf: str) -> list[datablock]:
+        self.leaflog.append(leaf)
+        datablocks: list[datablock] = []
+
+        for i in range(self.L + 1):
+            bucket_obj: bucket = self.read_bucket(leaf, i)
+
+            for block in bucket_obj.value:
+                datablocks.append(block)
+
         return datablocks
+
+    def set_block(self, key: str, block: datablock) -> bool:
+        if self.tree[key].setblock(block):
+            return True
+        else:
+            return False
     
-    def set_bukcket(self, datadict):
-        for k,v in datadict:
-            self.tree[k] = v
+    def set_bucket(self,key: str, value: bucket) -> None:
+        self.tree[key] = value
+        
 
 
 class bucket:
-    def __init__(self,Z):
-        self.Z = Z
-        self.value = list()
-    
-    def generate_dummy(self):
+    def __init__(self, Z: int) -> None:
+        self.Z: int = Z
+        self.value: list[datablock] = []
+
+    def generate_dummy(self) -> None:
         for _ in range(self.Z):
-            self.value.append(datablock(0,0,""))
-            
-    def __repr__(self):
+            dummy_addr: address = address(None)
+            self.value.append(datablock(dummy_addr, ""))
+
+    def __repr__(self) -> str:
         return "[" + ",".join(repr(i) for i in self.value) + "]"
+
+    def setblock(self, block: datablock) -> bool:
+        if len(self.value) < self.Z:
+            self.value.append(block)
+            return True
+        else:
+            return False
 
 
 class datablock:
-    def __init__(self,addr,path,data):
-        self.addr = address(addr)
-        self.path = path
-        self.data = data
-    
-    def __repr__(self):
+    def __init__(self, addr: address, data: str) -> None:
+        self.addr: address = addr
+        self.data: str = data
+
+    def __repr__(self) -> str:
         if self.addr.isdummy():
             return "dummy block"
-        return f"addr:{self.addr} path:{self.path} data:{self.data}"
+
+        return f"addr:{self.addr} data:{self.data}"
 
 
 class address:
-    def __init__(self,address):
-        if address == 0:
-            self.addr = None
-        else:
-            self.addr = address
+    def __init__(self, address_value: Optional[int]) -> None:
+        self.addr: Optional[int] = address_value
 
-    def isdummy(self):
+    def isdummy(self) -> bool:
         return self.addr is None
-        
-    def __repr__(self):
+
+    def __repr__(self) -> str:
         return f"address = {self.addr}"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, address):
+            return False
+
+        return self.addr == other.addr
+
+    def __hash__(self) -> int:
+        return hash(self.addr)
+
+
+class server:
+    def __init__(self, tree: ORAMtree) -> None:
+        self.tree: ORAMtree = tree
+
+    def getpath(self, path: str) -> list[datablock]:
+        return self.tree.read_path(path)
+
+    def reallocation(self,shuffle_dict: dict[str, bucket]) -> None:
+        for k,v in shuffle_dict.items():
+            self.tree.set_bucket(k,v)
+
+
+class client:
+    def __init__(self, pm: dict[address, str], stash: list[datablock], L: int, Z: int) -> None:
+        self.pm: dict[address, str] = pm
+        self.stash: list[datablock] = stash
+
+        self.L: int = L
+        self.Z: int = Z
+
+    def get_data(self, addr: address) -> str:
+        if addr not in self.pm:
+            raise KeyError(f"address {addr} is not in position map")
+
+        path: str = self.pm[addr]
+
+        return path
+
+    def get_random_data(self) -> tuple[str, address]:
+        keys_list: list[address] = list(self.pm)
+        random_key: address = random.choice(keys_list)
+
+        return self.get_data(random_key), random_key
+
+    def can_place_block(self, block_path: str, bucket_position: str) -> bool:
+        if bucket_position == ROOT_KEY:
+            return True
+
+        return block_path[:len(bucket_position)] == bucket_position
+
+    def shuffle(self, blocks: list[datablock], addr: address, leaf: str) -> dict[str, bucket]:
+        # position[a] <- UniformRandom(...)
+        self.pm[addr] = format(random.randrange(2**self.L), f"0{self.L}b")
+
+        # S <- S ∪ ReadBucket(...)
+        for block in blocks:
+            if not block.addr.isdummy():
+                self.stash.append(block)
+
+        shuffled: dict[str, bucket] = {}
+
+        # for ℓ = L, L-1, ..., 0
+        for level in range(self.L, -1, -1):
+            if level == 0:
+                key = ROOT_KEY
+            else:
+                key = leaf[:level]
+
+            new_bucket = bucket(self.Z)
+
+            # S' = {block in S : P(position[block.addr], level) == P(leaf, level)}
+            candidates: list[datablock] = []
+
+            for block in self.stash:
+                block_path = self.pm[block.addr]
+
+                if key == ROOT_KEY or block_path[:level] == key:
+                    candidates.append(block)
+
+            # Select min(|S'|, Z) blocks
+            selected = candidates[:self.Z]
+
+            for block in selected:
+                new_bucket.setblock(block)
+
+            # S <- S - S'
+            for block in selected:
+                self.stash.remove(block)
+
+            # WriteBucket(P(x, level), S')
+            shuffled[key] = new_bucket
+
+        return shuffled
+
+
+def random_leaf(L: int) -> str:
+    return format(random.randrange(2**L), f"0{L}b")
+
+
+def insert_block_to_path_random(tree: ORAMtree, block: datablock, path: str) -> bool:
+    leaf: str = path
+
+    levels: list[int] = list(range(tree.L + 1))
+    random.shuffle(levels)
+
+    for h in levels:
+        if h == 0:
+            key: str = ROOT_KEY
+        else:
+            key = leaf[:h]
+
+        if tree.set_block(key, block):
+            return True
+
+    return False
+
+def to_distribution(access_log):
+    count = Counter(access_log)
+    total = len(access_log)
+
+    return {
+        value: freq / total
+        for value, freq in count.items()
+    }
+
+def statistical_distance(dist1, dist2) -> float:
+    keys = set(dist1.keys()) | set(dist2.keys())
+
+    return 0.5 * sum(
+        abs(dist1.get(k, 0.0) - dist2.get(k, 0.0))
+        for k in keys
+    )
+
+N: int = 256
+L: int = 7
+Z: int = 4
+
+pm: dict[address, str] = {}
+stash: list[datablock] = []
+
+tree: ORAMtree = ORAMtree(L, Z)
+
+for i in range(N):
+    addr: address = address(i)
+    path: str = random_leaf(L)
+    data: str = str(i)
+
+    block: datablock = datablock(addr, data)
+
+    pm[addr] = path
+
+    success: bool = insert_block_to_path_random(tree, block, path)
+
+    if not success:
+        stash.append(block)
+
+
+tree1: ORAMtree = copy.deepcopy(tree)
+tree2: ORAMtree = copy.deepcopy(tree)
+
+pm1: dict[address, str] = copy.deepcopy(pm)
+pm2: dict[address, str] = copy.deepcopy(pm)
+
+stash1: list[datablock] = copy.deepcopy(stash)
+stash2: list[datablock] = copy.deepcopy(stash)
+
+oram_server1: server = server(tree1)
+oram_client1: client = client(pm1, stash1, L, Z)
+
+oram_server2: server = server(tree2)
+oram_client2: client = client(pm2, stash2, L, Z)
+
+
+# random workflow--------------------------------------------------------------
+for i in range(100000):
+    path, addr = oram_client1.get_random_data()
+
+    blocks: list[datablock] = oram_server1.getpath(path)
+    shuffle_dict: dict[str, bucket] = oram_client1.shuffle(blocks, addr, path)
+    oram_server1.reallocation(shuffle_dict)
+
+
+# fixed address workflow--------------------------------------------------------------
+for i in range(100000):
+    #addr = address(100)
+    #path = oram_client2.get_data(addr)
+    path, addr = oram_client2.get_random_data()
+
     
-
-pm = dict()
-stash = list()
-
-#128のデータを考える
-N = 128
-L = 6
-Z = 4
+    blocks: list[datablock] = oram_server2.getpath(path)
+    shuffle_dict: dict[str, bucket] = oram_client2.shuffle(blocks, addr, path)
+    oram_server2.reallocation(shuffle_dict)
 
 
-tree = ORAMtree(L, Z)
+leaf_distribution1 = to_distribution(oram_server1.tree.leaflog)
+leaf_distribution2 = to_distribution(oram_server2.tree.leaflog)
 
+bucket_distribution1 = to_distribution(oram_server1.tree.bucketlog)
+bucket_distribution2 = to_distribution(oram_server2.tree.bucketlog)
 
+print("statistical distance: leaf")
+print(statistical_distance(leaf_distribution1, leaf_distribution2))
 
+print("statistical distance: bucket")
+print(statistical_distance(bucket_distribution1, bucket_distribution2))
