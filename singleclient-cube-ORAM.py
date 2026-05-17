@@ -5,7 +5,7 @@ from typing import Optional
 import copy
 
 
-random.seed(542)
+#random.seed(420)
 
 class ORAMcube:
     def __init__(self,Bit: int,Z: int,PL: int) -> None:
@@ -13,6 +13,8 @@ class ORAMcube:
         self.Z: int = Z
         self.PL: int = PL
         self.cube: dict[str,bucket] = {}
+
+        self.root: str = format(0,f"0{self.Bit}b")
 
         for i in range(2 ** self.Bit):
             key: str = format(i,f"0{self.Bit}b")
@@ -106,8 +108,104 @@ class client:
         path: list[str] = list()
         self.accessblock = addr
 
-        #ここにパスの選定アルゴリズムを記述
+        block_position = self.pm[addr]
+        distance: int = 0
+        flip_list: list[int] = []
 
+        for i in range(self.Bit):
+            if block_position[i] == "1":
+                distance += 1
+                flip_list.append(i)
+        
+        random.shuffle(flip_list)
+
+        dif: int = self.PL - distance
+
+
+        path: list[str] = []
+        visited: set[str] = set()
+
+        last_bit = ["0" for _ in range(self.Bit)]
+
+        for i in flip_list:
+            path.append("".join(last_bit))
+            visited.add("".join(last_bit))
+            last_bit[i] = "1"
+
+
+        for i in range(random.randint(0, dif)):
+            candidates: list[int] = []
+
+            for bit in range(self.Bit):
+                next_bit = last_bit.copy()
+
+                if next_bit[bit] == "0":
+                    next_bit[bit] = "1"
+                else:
+                    next_bit[bit] = "0"
+
+                next_point = "".join(next_bit)
+
+                if next_point not in visited:
+                    candidates.append(bit)
+
+            if not candidates:
+                print("次の点が見つかりません")
+                raise ValueError
+
+            flipbit = random.choice(candidates)
+
+            if last_bit[flipbit] == "0":
+                last_bit[flipbit] = "1"
+            else:
+                last_bit[flipbit] = "0"
+
+            current_point = "".join(last_bit)
+
+            visited.add(current_point)
+            path.append(current_point)
+
+        
+        half_path: list[str] = []
+
+        last_bit = ["0" for _ in range(self.Bit)]
+
+        for i in range(0, self.PL - len(path)):
+            candidates: list[int] = []
+
+            for bit in range(self.Bit):
+                next_bit = last_bit.copy()
+
+                if next_bit[bit] == "0":
+                    next_bit[bit] = "1"
+                else:
+                    next_bit[bit] = "0"
+
+                next_point = "".join(next_bit)
+
+                if next_point not in visited:
+                    candidates.append(bit)
+
+            if not candidates:
+                print("次の点が見つかりません")
+                raise ValueError
+
+            flipbit = random.choice(candidates)
+
+            if last_bit[flipbit] == "0":
+                last_bit[flipbit] = "1"
+            else:
+                last_bit[flipbit] = "0"
+
+            current_point = "".join(last_bit)
+
+            visited.add(current_point)
+            half_path.append(current_point)
+                
+        half_path.reverse()
+
+        half_path.extend(path)
+        path = half_path
 
         self.pathlist = path
         return path
@@ -126,8 +224,8 @@ class client:
 
 
 
-N: int = 256
-Bit: int = 8
+N: int = 128
+Bit: int = 7
 Z: int = 4
 PL: int = 8
 
@@ -177,6 +275,8 @@ oram_client2: client = client(pm2,stash2,Bit,Z,PL)
 oram_client1.counter = oram_server1.give_counter()
 
 pathlist: list[str] = oram_client1.get_random_data()
+print(pathlist)
 datalist: list[datablock] = oram_server1.getpath(pathlist)
+print(datalist)
 shuffled: dict[str,bucket] = oram_client1.shuffle(datalist)
 oram_server1.reallocation(shuffled)
