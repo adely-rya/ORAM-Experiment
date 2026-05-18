@@ -232,7 +232,6 @@ class client:
 
         shuffled: dict[str, bucket] = {}
 
-        # 今回配置を試みるブロック
         all_blocks: list[datablock] = []
 
         for block_data in blocks:
@@ -243,15 +242,12 @@ class client:
 
         self.stash = []
 
-        # path 上の bucket を作る
         for position in self.pathlist:
             shuffled[position] = bucket(self.Z)
 
-        # 配置順もランダムにする
         random.shuffle(all_blocks)
 
         for block_data in all_blocks:
-            # bucket 候補をランダム順に試す
             candidate_positions: list[str] = self.pathlist.copy()
             random.shuffle(candidate_positions)
 
@@ -263,7 +259,6 @@ class client:
                     placed = True
                     break
 
-            # どの bucket にも入らなかったら stash に戻す
             if not placed:
                 self.stash.append(block_data)
 
@@ -288,9 +283,9 @@ def statistical_distance(dist1, dist2) -> float:
     )
 
 N: int = 128
-Bit: int = 7
+Bit: int = 8
 Z: int = 4
-PL: int = 8
+PL: int = 10
 
 pm: dict[int,str] = {}
 stash: list[datablock] = []
@@ -337,7 +332,7 @@ oram_client2: client = client(pm2,stash2,Bit,Z,PL)
 
 # random workflow--------------------------------------------------------------
 
-for i in range(100000):
+for i in range(10000):
     oram_client1.counter = oram_server1.give_counter()
     pathlist: list[str] = oram_client1.get_random_data()
     #print(pathlist)
@@ -349,10 +344,10 @@ for i in range(100000):
 
 # fixed address workflow--------------------------------------------------------------
 
-for i in range(100000):
+for i in range(10000):
     oram_client2.counter = oram_server2.give_counter()
-    #pathlist: list[str] = oram_client2.get_data(addr=100)
-    pathlist: list[str] = oram_client2.get_random_data()
+    pathlist: list[str] = oram_client2.get_data(i % 10)
+    #pathlist: list[str] = oram_client2.get_random_data()
     #print(pathlist)
     datalist: list[datablock] = oram_server2.getpath(pathlist)
     #print(datalist)
