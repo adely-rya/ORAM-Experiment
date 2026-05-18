@@ -3,9 +3,9 @@ from collections import Counter
 import random
 from typing import Optional
 import copy
+import logging
 
-
-#random.seed(420)
+random.seed(10)
 
 class ORAMcube:
     def __init__(self,Bit: int,Z: int,PL: int) -> None:
@@ -15,6 +15,8 @@ class ORAMcube:
         self.cube: dict[str,bucket] = {}
 
         self.root: str = format(0,f"0{self.Bit}b")
+
+        self.bucket_log: list[str] = []
 
         for i in range(2 ** self.Bit):
             key: str = format(i,f"0{self.Bit}b")
@@ -36,6 +38,7 @@ class ORAMcube:
         self.cube[key] = bucket
     
     def get_bucket(self,key: str) -> bucket:
+        self.bucket_log.append(key)
         return self.cube[key]
 
         
@@ -109,6 +112,11 @@ class client:
         self.accessblock = addr
 
         block_position = self.pm[addr]
+        #print(f"target position = {block_position}")
+        
+        if block_position == "S":
+            block_position = random.randint(0,len(self.pm))
+        
         distance: int = 0
         flip_list: list[int] = []
 
@@ -131,6 +139,10 @@ class client:
             path.append("".join(last_bit))
             visited.add("".join(last_bit))
             last_bit[i] = "1"
+
+        current_point = "".join(last_bit)
+        path.append(current_point)
+        visited.add(current_point)
 
 
         for i in range(random.randint(0, dif)):
@@ -213,16 +225,67 @@ class client:
     def get_random_data(self) -> list[str]:
         keys_list: list[int] = list(self.pm)
         random_key: int = random.choice(keys_list)
+        #print(f"block address = {random_key}")
         return self.get_data(random_key)
 
-    def shuffle(self,blocks: list[datablock]) -> dict[str,bucket]:
-        shuffled: dict[str,bucket] = {}
+    def shuffle(self, blocks: list[datablock]) -> dict[str, bucket]:
 
+        shuffled: dict[str, bucket] = {}
+
+        # 今回配置を試みるブロック
+        all_blocks: list[datablock] = []
+
+        for block_data in blocks:
+            all_blocks.append(block_data)
+
+        for block_data in self.stash:
+            all_blocks.append(block_data)
+
+        self.stash = []
+
+        # path 上の bucket を作る
+        for position in self.pathlist:
+            shuffled[position] = bucket(self.Z)
+
+        # 配置順もランダムにする
+        random.shuffle(all_blocks)
+
+        for block_data in all_blocks:
+            # bucket 候補をランダム順に試す
+            candidate_positions: list[str] = self.pathlist.copy()
+            random.shuffle(candidate_positions)
+
+            placed = False
+
+            for position in candidate_positions:
+                if shuffled[position].setblock(block_data):
+                    self.pm[block_data.addr] = position
+                    placed = True
+                    break
+
+            # どの bucket にも入らなかったら stash に戻す
+            if not placed:
+                self.stash.append(block_data)
 
 
         return shuffled
 
+def to_distribution(access_log):
+    count = Counter(access_log)
+    total = len(access_log)
 
+    return {
+        value: freq / total
+        for value, freq in count.items()
+    }
+
+def statistical_distance(dist1, dist2) -> float:
+    keys = set(dist1.keys()) | set(dist2.keys())
+
+    return 0.5 * sum(
+        abs(dist1.get(k, 0.0) - dist2.get(k, 0.0))
+        for k in keys
+    )
 
 N: int = 128
 Bit: int = 7
@@ -254,6 +317,8 @@ for i in range(N):
 print(cube)
 print(stash)
 
+print(pm)
+
 cube1: ORAMcube = copy.deepcopy(cube)
 cube2: ORAMcube = copy.deepcopy(cube)
 
@@ -272,11 +337,32 @@ oram_client2: client = client(pm2,stash2,Bit,Z,PL)
 
 # random workflow--------------------------------------------------------------
 
-oram_client1.counter = oram_server1.give_counter()
+for i in range(100000):
+    oram_client1.counter = oram_server1.give_counter()
+    pathlist: list[str] = oram_client1.get_random_data()
+    #print(pathlist)
+    datalist: list[datablock] = oram_server1.getpath(pathlist)
+    #print(datalist)
+    shuffled: dict[str,bucket] = oram_client1.shuffle(datalist)
+    #print(shuffled)
+    oram_server1.reallocation(shuffled)
 
-pathlist: list[str] = oram_client1.get_random_data()
-print(pathlist)
-datalist: list[datablock] = oram_server1.getpath(pathlist)
-print(datalist)
-shuffled: dict[str,bucket] = oram_client1.shuffle(datalist)
-oram_server1.reallocation(shuffled)
+# fixed address workflow--------------------------------------------------------------
+
+for i in range(100000):
+    oram_client2.counter = oram_server2.give_counter()
+    #pathlist: list[str] = oram_client2.get_data(addr=100)
+    pathlist: list[str] = oram_client2.get_random_data()
+    #print(pathlist)
+    datalist: list[datablock] = oram_server2.getpath(pathlist)
+    #print(datalist)
+    shuffled: dict[str,bucket] = oram_client2.shuffle(datalist)
+    #print(shuffled)
+    oram_server2.reallocation(shuffled)
+
+
+bucket_distribution1 = to_distribution(oram_server1.cube.bucket_log)
+bucket_distribution2 = to_distribution(oram_server2.cube.bucket_log)
+
+print("statistical distance: bucket")
+print(statistical_distance(bucket_distribution1, bucket_distribution2))
