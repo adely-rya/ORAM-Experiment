@@ -85,8 +85,7 @@ class bucket:
 
     def generate_dummy(self) -> None:
         for _ in range(self.Z):
-            dummy_addr: address = address(None)
-            self.value.append(datablock(dummy_addr, ""))
+            self.value.append(datablock(None, ""))
 
     def __repr__(self) -> str:
         return "[" + ",".join(repr(i) for i in self.value) + "]"
@@ -100,35 +99,18 @@ class bucket:
 
 
 class datablock:
-    def __init__(self, addr: address, data: str) -> None:
-        self.addr: address = addr
+    def __init__(self, addr: Optional[int], data: str) -> None:
+        self.addr: Optional[int] = addr
         self.data: str = data
-
-    def __repr__(self) -> str:
-        if self.addr.isdummy():
-            return "dummy block"
-
-        return f"addr:{self.addr} data:{self.data}"
-
-
-class address:
-    def __init__(self, address_value: Optional[int]) -> None:
-        self.addr: Optional[int] = address_value
 
     def isdummy(self) -> bool:
         return self.addr is None
 
     def __repr__(self) -> str:
-        return f"address = {self.addr}"
+        if self.isdummy():
+            return "dummy block"
 
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, address):
-            return False
-
-        return self.addr == other.addr
-
-    def __hash__(self) -> int:
-        return hash(self.addr)
+        return f"addr:{self.addr} data:{self.data}"
 
 
 class server:
@@ -144,26 +126,41 @@ class server:
 
 
 class client:
-    def __init__(self, pm: dict[address, str], stash: list[datablock], L: int, Z: int) -> None:
-        self.pm: dict[address, str] = pm
+    def __init__(self, pm: dict[int, str], stash: list[datablock], L: int, Z: int) -> None:
+        self.pm: dict[int, str] = pm
         self.stash: list[datablock] = stash
 
         self.L: int = L
         self.Z: int = Z
 
-    def get_data(self, addr: address) -> str:
-        if addr not in self.pm:
-            raise KeyError(f"address {addr} is not in position map")
+        self.accessblock: Optional[int] = None
+        self.leaf: str = ""
+
+    def get_data(self, addr: int) -> str:
+
+        instash: bool = False
+        for i in self.stash:
+            if addr == i.addr:
+                instash = True
+                break
+        
+        self.accessblock = addr
+        
+        if instash:
+            keys_list: list[int] = list(self.pm)
+            addr = random.choice(keys_list)
+
 
         path: str = self.pm[addr]
+        self.leaf = path
 
         return path
 
-    def get_random_data(self) -> tuple[str, address]:
-        keys_list: list[address] = list(self.pm)
-        random_key: address = random.choice(keys_list)
+    def get_random_data(self) -> str:
+        keys_list: list[int] = list(self.pm)
+        random_key: int = random.choice(keys_list)
 
-        return self.get_data(random_key), random_key
+        return self.get_data(random_key)
 
     def can_place_block(self, block_path: str, bucket_position: str) -> bool:
         if bucket_position == ROOT_KEY:
@@ -171,13 +168,16 @@ class client:
 
         return block_path[:len(bucket_position)] == bucket_position
 
-    def shuffle(self, blocks: list[datablock], addr: address, leaf: str) -> dict[str, bucket]:
+    def shuffle(self, blocks: list[datablock]) -> dict[str, bucket]:
+        if self.accessblock is None:
+            raise ValueError("get_data or get_random_data must be called before shuffle")
+
         # position[a] <- UniformRandom(...)
-        self.pm[addr] = format(random.randrange(2**self.L), f"0{self.L}b")
+        self.pm[self.accessblock] = format(random.randrange(2**self.L), f"0{self.L}b")
 
         # S <- S ∪ ReadBucket(...)
         for block in blocks:
-            if not block.addr.isdummy():
+            if not block.isdummy():
                 self.stash.append(block)
 
         shuffled: dict[str, bucket] = {}
@@ -187,7 +187,7 @@ class client:
             if level == 0:
                 key = ROOT_KEY
             else:
-                key = leaf[:level]
+                key = self.leaf[:level]
 
             new_bucket = bucket(self.Z)
 
@@ -195,6 +195,9 @@ class client:
             candidates: list[datablock] = []
 
             for block in self.stash:
+                if block.addr is None:
+                    continue
+
                 block_path = self.pm[block.addr]
 
                 if key == ROOT_KEY or block_path[:level] == key:
@@ -212,6 +215,7 @@ class client:
 
             # WriteBucket(P(x, level), S')
             shuffled[key] = new_bucket
+
 
         return shuffled
 
@@ -258,13 +262,13 @@ N: int = 256
 L: int = 7
 Z: int = 4
 
-pm: dict[address, str] = {}
+pm: dict[int, str] = {}
 stash: list[datablock] = []
 
 tree: ORAMtree = ORAMtree(L, Z)
 
 for i in range(N):
-    addr: address = address(i)
+    addr: int = i
     path: str = random_leaf(L)
     data: str = str(i)
 
@@ -281,8 +285,8 @@ for i in range(N):
 tree1: ORAMtree = copy.deepcopy(tree)
 tree2: ORAMtree = copy.deepcopy(tree)
 
-pm1: dict[address, str] = copy.deepcopy(pm)
-pm2: dict[address, str] = copy.deepcopy(pm)
+pm1: dict[int, str] = copy.deepcopy(pm)
+pm2: dict[int, str] = copy.deepcopy(pm)
 
 stash1: list[datablock] = copy.deepcopy(stash)
 stash2: list[datablock] = copy.deepcopy(stash)
@@ -295,34 +299,29 @@ oram_client2: client = client(pm2, stash2, L, Z)
 
 
 # random workflow--------------------------------------------------------------
-for i in range(100000):
-    path, addr = oram_client1.get_random_data()
+for i in range(10000000):
+    path: str = oram_client1.get_random_data()
 
     blocks: list[datablock] = oram_server1.getpath(path)
-    shuffle_dict: dict[str, bucket] = oram_client1.shuffle(blocks, addr, path)
+    shuffle_dict: dict[str, bucket] = oram_client1.shuffle(blocks)
     oram_server1.reallocation(shuffle_dict)
 
 
 # fixed address workflow--------------------------------------------------------------
-for i in range(100000):
-    #addr = address(100)
+for i in range(10000000):
+    #addr = 100
     #path = oram_client2.get_data(addr)
-    path, addr = oram_client2.get_random_data()
+    path: str = oram_client2.get_random_data()
 
     
     blocks: list[datablock] = oram_server2.getpath(path)
-    shuffle_dict: dict[str, bucket] = oram_client2.shuffle(blocks, addr, path)
+    shuffle_dict: dict[str, bucket] = oram_client2.shuffle(blocks)
     oram_server2.reallocation(shuffle_dict)
 
-
-leaf_distribution1 = to_distribution(oram_server1.tree.leaflog)
-leaf_distribution2 = to_distribution(oram_server2.tree.leaflog)
 
 bucket_distribution1 = to_distribution(oram_server1.tree.bucketlog)
 bucket_distribution2 = to_distribution(oram_server2.tree.bucketlog)
 
-print("statistical distance: leaf")
-print(statistical_distance(leaf_distribution1, leaf_distribution2))
 
 print("statistical distance: bucket")
 print(statistical_distance(bucket_distribution1, bucket_distribution2))
