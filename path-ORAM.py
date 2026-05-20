@@ -260,7 +260,7 @@ def statistical_distance(dist1, dist2) -> float:
 
 N: int = 256
 L: int = 7
-Z: int = 4
+Z: int = 2
 
 pm: dict[int, str] = {}
 stash: list[datablock] = []
@@ -299,7 +299,8 @@ oram_client2: client = client(pm2, stash2, L, Z)
 
 
 # random workflow--------------------------------------------------------------
-for i in range(10000000):
+for i in range(10000):
+    print(len(oram_client1.stash))
     path: str = oram_client1.get_random_data()
 
     blocks: list[datablock] = oram_server1.getpath(path)
@@ -308,7 +309,8 @@ for i in range(10000000):
 
 
 # fixed address workflow--------------------------------------------------------------
-for i in range(10000000):
+for i in range(10000):
+    #print(len(oram_client1.stash))
     #addr = 100
     #path = oram_client2.get_data(addr)
     path: str = oram_client2.get_random_data()

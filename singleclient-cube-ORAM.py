@@ -3,7 +3,8 @@ from collections import Counter
 import random
 from typing import Optional
 import copy
-import logging
+from PRF import random_int
+import math
 
 random.seed(10)
 
@@ -94,7 +95,7 @@ class server:
 
     
 class client:
-    def __init__(self, pm: dict[int, str], stash: list[datablock], Bit: int, Z: int, PL: int) -> None:
+    def __init__(self, pm: dict[int, str], stash: list[datablock], Bit: int, Z: int, PL: int, window: int) -> None:
         self.pm: dict[int, str] = pm
         self.stash: list[datablock] = stash
 
@@ -106,13 +107,34 @@ class client:
 
         self.accessblock: int = 0
         self.pathlist: list[str] = []
+
+        self.window: int = window #どれぐらいの共通アクセスを気にするのか
+        self.seed = 123 #PRF用のシード　本当は共通鍵
     
     def get_data(self, addr: int) -> list[str]:
+        def PRF_listsort(seed: int,a: list) -> list:
+            if seed < 0 or seed >= math.factorial(len(a)):
+                raise ValueError
+            
+            result: list = list()
+
+            for i in range(len(a),0,-1):
+                fact = math.factorial(i - 1)
+                index = seed //fact
+                seed = seed % fact
+
+                result.append(a.pop(index))
+        
+            return result
+
+            
+
+        #flip_order = format(random_int(self.seed,self.counter), f"0{Bit}b")
+
         path: list[str] = list()
         self.accessblock = addr
 
         block_position = self.pm[addr]
-        #print(f"target position = {block_position}")
         
         if block_position == "S":
             block_position = random.randint(0,len(self.pm))
@@ -122,12 +144,12 @@ class client:
 
         for i in range(self.Bit):
             if block_position[i] == "1":
-                distance += 1
-                flip_list.append(i)
+                distance += 1 #ターゲットとrootの距離を加算
+                flip_list.append(i)#フリップする場所を決定
         
-        random.shuffle(flip_list)
+        random.shuffle(flip_list)#フリップする場所のシャッフル
 
-        dif: int = self.PL - distance
+        dif: int = self.PL - distance  #パスの長さから残りの距離を算出
 
 
         path: list[str] = []
@@ -136,7 +158,7 @@ class client:
         last_bit = ["0" for _ in range(self.Bit)]
 
         for i in flip_list:
-            path.append("".join(last_bit))
+            path.append("".join(last_bit))#ランダムにビットをフリップしていってパスを生成。
             visited.add("".join(last_bit))
             last_bit[i] = "1"
 
@@ -287,6 +309,8 @@ Bit: int = 8
 Z: int = 4
 PL: int = 10
 
+Window: int = 100
+
 pm: dict[int,str] = {}
 stash: list[datablock] = []
 
@@ -324,15 +348,15 @@ stash1: list[datablock] = copy.deepcopy(stash)
 stash2: list[datablock] = copy.deepcopy(stash)
 
 oram_server1: server = server(cube1)
-oram_client1: client = client(pm1,stash1,Bit,Z,PL)
+oram_client1: client = client(pm1,stash1,Bit,Z,PL,Window)
 
 oram_server2: server = server(cube2)
-oram_client2: client = client(pm2,stash2,Bit,Z,PL)
+oram_client2: client = client(pm2,stash2,Bit,Z,PL,Window)
 
 
 # random workflow--------------------------------------------------------------
 
-for i in range(10000):
+for i in range(100000):
     oram_client1.counter = oram_server1.give_counter()
     pathlist: list[str] = oram_client1.get_random_data()
     #print(pathlist)
@@ -344,10 +368,10 @@ for i in range(10000):
 
 # fixed address workflow--------------------------------------------------------------
 
-for i in range(10000):
+for i in range(100000):
     oram_client2.counter = oram_server2.give_counter()
-    pathlist: list[str] = oram_client2.get_data(i % 10)
-    #pathlist: list[str] = oram_client2.get_random_data()
+    #pathlist: list[str] = oram_client2.get_data(i % 10)
+    pathlist: list[str] = oram_client2.get_random_data()
     #print(pathlist)
     datalist: list[datablock] = oram_server2.getpath(pathlist)
     #print(datalist)
