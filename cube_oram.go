@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"slices"
 	"strconv"
 	"time"
 )
@@ -155,9 +156,12 @@ func NewCubeClient(pm []int, stash []CubeDataBlock, bit, z, pl int, rng *rand.Ra
 func (c *CubeClient) GetData(addr int) []int {
 	c.accessBlock = addr
 
-	blockPosition := c.PM[addr]
-	if blockPosition < 0 {
+	pmPosition := c.PM[addr]
+	blockPosition := 0
+	if pmPosition == 0 {
 		blockPosition = c.RNG.Intn(1 << c.Bit)
+	} else {
+		blockPosition = pmPosition - 1
 	}
 
 	distance := 0
@@ -187,23 +191,7 @@ func (c *CubeClient) GetData(addr int) []int {
 	path = append(path, last)
 	visited[last] = true
 
-	if dif > 0 {
-		extraSteps := c.RNG.Intn(dif + 1)
-		for i := 0; i < extraSteps; i++ {
-			candidates := unvisitedNeighbors(last, c.Bit, visited)
-			if len(candidates) == 0 {
-				panic("next point is missing")
-			}
-
-			last = candidates[c.RNG.Intn(len(candidates))]
-			visited[last] = true
-			path = append(path, last)
-		}
-	}
-
-	halfPath := make([]int, 0, max(0, c.PL-len(path)))
-	last = 0
-	for i := 0; i < c.PL-len(path); i++ {
+	for i := 0; i < dif; i++ {
 		candidates := unvisitedNeighbors(last, c.Bit, visited)
 		if len(candidates) == 0 {
 			panic("next point is missing")
@@ -211,49 +199,99 @@ func (c *CubeClient) GetData(addr int) []int {
 
 		last = candidates[c.RNG.Intn(len(candidates))]
 		visited[last] = true
-		halfPath = append(halfPath, last)
+		path = append(path, last)
 	}
 
-	for i, j := 0, len(halfPath)-1; i < j; i, j = i+1, j-1 {
-		halfPath[i], halfPath[j] = halfPath[j], halfPath[i]
-	}
-
-	path = append(halfPath, path...)
 	c.pathList = path
 	return path
 }
 
 func (c *CubeClient) GetRandomData() []int {
-	return c.GetData(c.RNG.Intn(len(c.PM)))
+	return c.GetData(1 + c.RNG.Intn(len(c.PM)-1))
 }
 
 func (c *CubeClient) Shuffle(blocks []CubeDataBlock) map[int]CubeBucket {
 	shuffled := make(map[int]CubeBucket, len(c.pathList))
 	allBlocks := make([]CubeDataBlock, 0, len(blocks)+len(c.Stash))
-	allBlocks = append(allBlocks, blocks...)
-	allBlocks = append(allBlocks, c.Stash...)
+	targetBlock := CubeDataBlock{}
+	hasTargetBlock := false
+
+	for _, block := range blocks {
+		if block.Addr == c.accessBlock {
+			targetBlock = block
+			hasTargetBlock = true
+			continue
+		}
+		allBlocks = append(allBlocks, block)
+	}
+
+	for _, block := range c.Stash {
+		if block.Addr == c.accessBlock {
+			targetBlock = block
+			hasTargetBlock = true
+			continue
+		}
+		allBlocks = append(allBlocks, block)
+	}
 	c.Stash = nil
 
 	for _, position := range c.pathList {
 		shuffled[position] = NewCubeBucket(c.Z)
 	}
 
-	c.RNG.Shuffle(len(allBlocks), func(i, j int) {
-		allBlocks[i], allBlocks[j] = allBlocks[j], allBlocks[i]
-	})
+	nextStash := make([]CubeDataBlock, 0)
+
+	if hasTargetBlock {
+		rootPosition := 0
+		bucket := shuffled[rootPosition]
+		if bucket.SetBlock(targetBlock) {
+			shuffled[rootPosition] = bucket
+			c.PM[c.accessBlock] = rootPosition + 1
+		} else {
+			nextStash = append(nextStash, targetBlock)
+			c.PM[c.accessBlock] = 0
+		}
+	}
 
 	for _, block := range allBlocks {
-		candidatePositions := append([]int(nil), c.pathList...)
-		c.RNG.Shuffle(len(candidatePositions), func(i, j int) {
-			candidatePositions[i], candidatePositions[j] = candidatePositions[j], candidatePositions[i]
-		})
+		pmPosition := c.PM[block.Addr]
+		if pmPosition == 0 {
+			nextStash = append(nextStash, block)
+			c.PM[block.Addr] = 0
+			continue
+		}
 
+		position := pmPosition - 1
+		bucket, ok := shuffled[position]
+		if !ok {
+			nextStash = append(nextStash, block)
+			c.PM[block.Addr] = 0
+			continue
+		}
+
+		if bucket.SetBlock(block) {
+			shuffled[position] = bucket
+			c.PM[block.Addr] = position + 1
+		} else {
+			nextStash = append(nextStash, block)
+			c.PM[block.Addr] = 0
+		}
+	}
+
+	c.Stash = nil
+	rootFirstPositions := append([]int(nil), c.pathList...)
+	slices.SortFunc(rootFirstPositions, func(a, b int) int {
+		return bitsCount(a) - bitsCount(b)
+	})
+
+	for _, block := range nextStash {
 		placed := false
-		for _, position := range candidatePositions {
+
+		for _, position := range rootFirstPositions {
 			bucket := shuffled[position]
 			if bucket.SetBlock(block) {
 				shuffled[position] = bucket
-				c.PM[block.Addr] = position
+				c.PM[block.Addr] = position + 1
 				placed = true
 				break
 			}
@@ -261,11 +299,20 @@ func (c *CubeClient) Shuffle(blocks []CubeDataBlock) map[int]CubeBucket {
 
 		if !placed {
 			c.Stash = append(c.Stash, block)
-			c.PM[block.Addr] = -1
+			c.PM[block.Addr] = 0
 		}
 	}
 
 	return shuffled
+}
+
+func bitsCount(value int) int {
+	count := 0
+	for value > 0 {
+		count += value & 1
+		value >>= 1
+	}
+	return count
 }
 
 func flipHypercubeBit(position, bit, bitCount int) int {
@@ -355,12 +402,12 @@ func runCubeRandomAccess(client *CubeClient, server *CubeServer) {
 	server.Reallocation(shuffled)
 }
 
-func runCubeModeAccess(client *CubeClient, server *CubeServer, mode string, accessIndex int64, n int) {
+func runCubeModeAccess(client *CubeClient, server *CubeServer, mode string) {
 	client.Counter = server.GiveCounter()
 
 	var path []int
 	if mode == "fixed" {
-		path = client.GetData(int(accessIndex % int64(min(n, 10))))
+		path = client.GetData(10)
 	} else {
 		path = client.GetRandomData()
 	}
@@ -415,19 +462,19 @@ func main() {
 	}
 
 	initRNG := rand.New(rand.NewSource(seed))
-	pm := make([]int, n)
+	pm := make([]int, n+1)
 	stash := make([]CubeDataBlock, 0)
 	cube := NewORAMCube(bit, z, pl)
 
-	for i := 0; i < n; i++ {
+	for addr := 1; addr <= n; addr++ {
 		position := initRNG.Intn(1 << bit)
-		block := CubeDataBlock{Addr: i, Data: strconv.Itoa(i)}
+		block := CubeDataBlock{Addr: addr, Data: strconv.Itoa(addr)}
 
 		if cube.SetBlock(position, block) {
-			pm[i] = position
+			pm[addr] = position + 1
 		} else {
 			stash = append(stash, block)
-			pm[i] = -1
+			pm[addr] = 0
 		}
 	}
 
@@ -492,10 +539,10 @@ func main() {
 		for completed < checkpoint {
 			runCubeRandomAccess(&client1, &server1)
 			if workflowMode == "both" {
-				runCubeModeAccess(&client2, &server2, "random", completed, n)
-				runCubeModeAccess(&client3, &server3, "fixed", completed, n)
+				runCubeModeAccess(&client2, &server2, "random")
+				runCubeModeAccess(&client3, &server3, "fixed")
 			} else {
-				runCubeModeAccess(&client2, &server2, workflowMode, completed, n)
+				runCubeModeAccess(&client2, &server2, workflowMode)
 			}
 			completed++
 		}

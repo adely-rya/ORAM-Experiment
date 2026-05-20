@@ -95,8 +95,8 @@ class server:
 
     
 class client:
-    def __init__(self, pm: dict[int, str], stash: list[datablock], Bit: int, Z: int, PL: int, window: int) -> None:
-        self.pm: dict[int, str] = pm
+    def __init__(self, pm: dict[int, str | int], stash: list[datablock], Bit: int, Z: int, PL: int, window: int) -> None:
+        self.pm: dict[int, str | int] = pm
         self.stash: list[datablock] = stash
 
         self.counter: int  = 0
@@ -112,32 +112,15 @@ class client:
         self.seed = 123 #PRF用のシード　本当は共通鍵
     
     def get_data(self, addr: int) -> list[str]:
-        def PRF_listsort(seed: int,a: list) -> list:
-            if seed < 0 or seed >= math.factorial(len(a)):
-                raise ValueError
-            
-            result: list = list()
 
-            for i in range(len(a),0,-1):
-                fact = math.factorial(i - 1)
-                index = seed //fact
-                seed = seed % fact
-
-                result.append(a.pop(index))
-        
-            return result
-
-            
-
-        #flip_order = format(random_int(self.seed,self.counter), f"0{Bit}b")
 
         path: list[str] = list()
         self.accessblock = addr
 
         block_position = self.pm[addr]
         
-        if block_position == "S":
-            block_position = random.randint(0,len(self.pm))
+        if block_position == 0:
+            block_position = format(random.randrange(2**self.Bit), f"0{self.Bit}b")
         
         distance: int = 0
         flip_list: list[int] = []
@@ -167,7 +150,7 @@ class client:
         visited.add(current_point)
 
 
-        for i in range(random.randint(0, dif)):
+        for i in range(dif):
             candidates: list[int] = []
 
             for bit in range(self.Bit):
@@ -199,47 +182,6 @@ class client:
             visited.add(current_point)
             path.append(current_point)
 
-        
-        half_path: list[str] = []
-
-        last_bit = ["0" for _ in range(self.Bit)]
-
-        for i in range(0, self.PL - len(path)):
-            candidates: list[int] = []
-
-            for bit in range(self.Bit):
-                next_bit = last_bit.copy()
-
-                if next_bit[bit] == "0":
-                    next_bit[bit] = "1"
-                else:
-                    next_bit[bit] = "0"
-
-                next_point = "".join(next_bit)
-
-                if next_point not in visited:
-                    candidates.append(bit)
-
-            if not candidates:
-                print("次の点が見つかりません")
-                raise ValueError
-
-            flipbit = random.choice(candidates)
-
-            if last_bit[flipbit] == "0":
-                last_bit[flipbit] = "1"
-            else:
-                last_bit[flipbit] = "0"
-
-            current_point = "".join(last_bit)
-
-            visited.add(current_point)
-            half_path.append(current_point)
-                
-        half_path.reverse()
-
-        half_path.extend(path)
-        path = half_path
 
         self.pathlist = path
         return path
@@ -256,10 +198,24 @@ class client:
 
         all_blocks: list[datablock] = []
 
-        for block_data in blocks:
+        target_blocks: Optional[datablock] = None
+
+        for block_data in blocks:  
+            if block_data is None:
+                continue
+
+            if block_data.addr == self.accessblock:
+                target_blocks = block_data
+                continue
             all_blocks.append(block_data)
 
         for block_data in self.stash:
+            if block_data is None:
+                continue
+
+            if block_data.addr == self.accessblock:
+                target_blocks = block_data
+                continue
             all_blocks.append(block_data)
 
         self.stash = []
@@ -267,15 +223,40 @@ class client:
         for position in self.pathlist:
             shuffled[position] = bucket(self.Z)
 
-        random.shuffle(all_blocks)
+        next_stash: list[datablock] = []
+
+        if target_blocks is not None:
+            root_position = "0" * self.Bit
+            if root_position in shuffled and shuffled[root_position].setblock(target_blocks):
+                self.pm[self.accessblock] = root_position
+            else:
+                next_stash.append(target_blocks)
+                self.pm[self.accessblock] = 0
+
 
         for block_data in all_blocks:
-            candidate_positions: list[str] = self.pathlist.copy()
-            random.shuffle(candidate_positions)
+            block_position = self.pm[block_data.addr]
 
+            if block_position == 0 or block_position not in shuffled:
+                next_stash.append(block_data)
+                self.pm[block_data.addr] = 0
+                continue
+
+            if not(shuffled[block_position].setblock(block_data)):
+                next_stash.append(block_data)
+                self.pm[block_data.addr] = 0
+
+        self.stash = []
+
+        root_first_positions: list[str] = sorted(
+            self.pathlist,
+            key=lambda position: position.count("1")
+        )
+
+        for block_data in next_stash:
             placed = False
 
-            for position in candidate_positions:
+            for position in root_first_positions:
                 if shuffled[position].setblock(block_data):
                     self.pm[block_data.addr] = position
                     placed = True
@@ -283,6 +264,8 @@ class client:
 
             if not placed:
                 self.stash.append(block_data)
+                self.pm[block_data.addr] = 0
+                
 
 
         return shuffled
@@ -304,23 +287,23 @@ def statistical_distance(dist1, dist2) -> float:
         for k in keys
     )
 
-N: int = 128
-Bit: int = 8
-Z: int = 4
-PL: int = 10
+N: int = 256
+Bit: int = 9
+Z: int = 2
+PL: int = 11
 
 Window: int = 100
 
-pm: dict[int,str] = {}
+pm: dict[int, str | int] = {}
 stash: list[datablock] = []
 
 cube = ORAMcube(Bit,Z,PL)
 
 
-for i in range(N):
+for i in range(1, N + 1):
     addr: int = i
     position: str = format(random.randrange(2**Bit), f"0{Bit}b")
-    data: str = str(i)
+    data: str = str(addr)
 
     block: datablock = datablock(addr,data)
 
@@ -330,7 +313,7 @@ for i in range(N):
         pm[addr] = position
     else:
         stash.append(block)
-        pm[addr] = "S"
+        pm[addr] = 0
 
 
 print(cube)
@@ -341,8 +324,8 @@ print(pm)
 cube1: ORAMcube = copy.deepcopy(cube)
 cube2: ORAMcube = copy.deepcopy(cube)
 
-pm1: dict[int, str] = copy.deepcopy(pm)
-pm2: dict[int, str] = copy.deepcopy(pm)
+pm1: dict[int, str | int] = copy.deepcopy(pm)
+pm2: dict[int, str | int] = copy.deepcopy(pm)
 
 stash1: list[datablock] = copy.deepcopy(stash)
 stash2: list[datablock] = copy.deepcopy(stash)
@@ -356,7 +339,7 @@ oram_client2: client = client(pm2,stash2,Bit,Z,PL,Window)
 
 # random workflow--------------------------------------------------------------
 
-for i in range(100000):
+for i in range(10000):
     oram_client1.counter = oram_server1.give_counter()
     pathlist: list[str] = oram_client1.get_random_data()
     #print(pathlist)
@@ -368,16 +351,16 @@ for i in range(100000):
 
 # fixed address workflow--------------------------------------------------------------
 
-for i in range(100000):
+for i in range(10000):
     oram_client2.counter = oram_server2.give_counter()
-    #pathlist: list[str] = oram_client2.get_data(i % 10)
+    #pathlist: list[str] = oram_client2.get_data(10)
     pathlist: list[str] = oram_client2.get_random_data()
-    #print(pathlist)
     datalist: list[datablock] = oram_server2.getpath(pathlist)
     #print(datalist)
     shuffled: dict[str,bucket] = oram_client2.shuffle(datalist)
     #print(shuffled)
     oram_server2.reallocation(shuffled)
+
 
 
 bucket_distribution1 = to_distribution(oram_server1.cube.bucket_log)
