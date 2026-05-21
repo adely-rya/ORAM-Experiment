@@ -17,7 +17,6 @@ class ORAMtree:
         self.Z: int = Z
         self.tree: dict[str, bucket] = {}
         self.leaflog: list[str] = list()
-        self.bucketlog: list[str] = list()
 
         for h in range(self.L + 1):
             for i in range(2**h):
@@ -146,15 +145,36 @@ class client:
         
         self.accessblock = addr
         
+
+        leaf_list:list[str] = []
+        for i in range(2**self.L):
+            leaf_list.append(format(i, f"0{self.L}b"))
+        #リーフのリストを生成
+
+
+        #スタッシュにあった場合はランダムなパス
         if instash:
-            keys_list: list[int] = list(self.pm)
-            addr = random.choice(keys_list)
+            self.leaf = random.choice(leaf_list)
+        
+            #リーフリストかランダムにリーフを選択してreturn
 
+            return self.leaf
 
-        path: str = self.pm[addr]
-        self.leaf = path
+        #スタッシュなかった場合はアクセスブロックを通るリーフを選定
 
-        return path
+        candinate_leaf:list[str] = []
+        block_position: str = self.pm[addr]
+
+        for i in leaf_list:
+            if i.startswith(block_position):
+                candinate_leaf.append(i)
+        
+        #候補からランダムにリーフを選んでリターン
+        if not candinate_leaf:
+            raise ValueError("access block position does not match any leaf")
+
+        self.leaf = random.choice(candinate_leaf)
+        return self.leaf
 
     def get_random_data(self) -> str:
         keys_list: list[int] = list(self.pm)
@@ -172,49 +192,34 @@ class client:
         if self.accessblock is None:
             raise ValueError("get_data or get_random_data must be called before shuffle")
 
-        # position[a] <- UniformRandom(...)
-        self.pm[self.accessblock] = format(random.randrange(2**self.L), f"0{self.L}b")
+        W: list[datablock] = []
 
-        # S <- S ∪ ReadBucket(...)
+        #Wにブロックを全部入れる
         for block in blocks:
             if not block.isdummy():
-                self.stash.append(block)
+                W.append(block)
+        
+        for block in self.stash:
+            W.append(block)
+
 
         shuffled: dict[str, bucket] = {}
 
-        # for ℓ = L, L-1, ..., 0
         for level in range(self.L, -1, -1):
             if level == 0:
                 key = ROOT_KEY
             else:
                 key = self.leaf[:level]
-
+            
             new_bucket = bucket(self.Z)
 
-            # S' = {block in S : P(position[block.addr], level) == P(leaf, level)}
-            candidates: list[datablock] = []
-
-            for block in self.stash:
-                if block.addr is None:
-                    continue
-
-                block_path = self.pm[block.addr]
-
-                if key == ROOT_KEY or block_path[:level] == key:
-                    candidates.append(block)
-
-            # Select min(|S'|, Z) blocks
-            selected = candidates[:self.Z]
-
-            for block in selected:
-                new_bucket.setblock(block)
-
-            # S <- S - S'
-            for block in selected:
-                self.stash.remove(block)
-
-            # WriteBucket(P(x, level), S')
             shuffled[key] = new_bucket
+        
+        
+
+
+
+        
 
 
         return shuffled
@@ -281,7 +286,6 @@ for i in range(N):
     if not success:
         stash.append(block)
 
-print(pm)
 
 tree1: ORAMtree = copy.deepcopy(tree)
 tree2: ORAMtree = copy.deepcopy(tree)
@@ -301,6 +305,7 @@ oram_client2: client = client(pm2, stash2, L, Z)
 
 # random workflow--------------------------------------------------------------
 for i in range(10000):
+    print(len(oram_client1.stash))
     path: str = oram_client1.get_random_data()
 
     blocks: list[datablock] = oram_server1.getpath(path)

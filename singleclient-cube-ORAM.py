@@ -6,7 +6,7 @@ import copy
 from PRF import random_int
 import math
 
-random.seed(10)
+#random.seed(10)
 
 class ORAMcube:
     def __init__(self,Bit: int,Z: int,PL: int) -> None:
@@ -111,80 +111,141 @@ class client:
         self.window: int = window #どれぐらいの共通アクセスを気にするのか
         self.seed = 123 #PRF用のシード　本当は共通鍵
     
-    def get_data(self, addr: int) -> list[str]:
+    def get_data(self, addr: int, target_step: int | None = None) -> list[str]:
 
-
-        path: list[str] = list()
         self.accessblock = addr
 
         block_position = self.pm[addr]
-        
-        if block_position == 0:
+
+        if block_position == format(0, f"0{self.Bit}b"):
             block_position = format(random.randrange(2**self.Bit), f"0{self.Bit}b")
-        
-        distance: int = 0
-        flip_list: list[int] = []
 
-        for i in range(self.Bit):
-            if block_position[i] == "1":
-                distance += 1 #ターゲットとrootの距離を加算
-                flip_list.append(i)#フリップする場所を決定
-        
-        random.shuffle(flip_list)#フリップする場所のシャッフル
+        target: str = block_position
+        root: str = "0" * self.Bit
 
-        dif: int = self.PL - distance  #パスの長さから残りの距離を算出
+        def hamming(a: str, b: str) -> int:
+            return sum(x != y for x, y in zip(a, b))
 
+        def flip_point(point: str, bit: int) -> str:
+            point_list = list(point)
+            point_list[bit] = "1" if point_list[bit] == "0" else "0"
+            return "".join(point_list)
 
-        path: list[str] = []
-        visited: set[str] = set()
+        distance = hamming(root, target)
 
-        last_bit = ["0" for _ in range(self.Bit)]
+        # target に到達できる step 候補を作る
+        # ハイパーキューブでは偶奇制約があるので、
+        # target_step と distance の偶奇は一致する必要がある
+        if distance == 0:
+            possible_target_steps = [0]
+        else:
+            possible_target_steps = [
+                step for step in range(distance, self.PL + 1)
+                if step % 2 == distance % 2
+            ]
 
-        for i in flip_list:
-            path.append("".join(last_bit))#ランダムにビットをフリップしていってパスを生成。
-            visited.add("".join(last_bit))
-            last_bit[i] = "1"
+        if not possible_target_steps:
+            raise ValueError("指定された PL では target を通るパスを作れません")
 
-        current_point = "".join(last_bit)
-        path.append(current_point)
-        visited.add(current_point)
+        max_retry = 1000
 
+        for _ in range(max_retry):
 
-        for i in range(dif):
-            candidates: list[int] = []
-
-            for bit in range(self.Bit):
-                next_bit = last_bit.copy()
-
-                if next_bit[bit] == "0":
-                    next_bit[bit] = "1"
-                else:
-                    next_bit[bit] = "0"
-
-                next_point = "".join(next_bit)
-
-                if next_point not in visited:
-                    candidates.append(bit)
-
-            if not candidates:
-                print("次の点が見つかりません")
-                raise ValueError
-
-            flipbit = random.choice(candidates)
-
-            if last_bit[flipbit] == "0":
-                last_bit[flipbit] = "1"
+            if target_step is None:
+                selected_target_step = random.choice(possible_target_steps)
             else:
-                last_bit[flipbit] = "0"
+                selected_target_step = target_step
 
-            current_point = "".join(last_bit)
+                if selected_target_step not in possible_target_steps:
+                    raise ValueError("target_step が距離・偶奇制約を満たしていません")
 
-            visited.add(current_point)
+            path: list[str] = []
+            visited: set[str] = set()
+
+            current_point = root
             path.append(current_point)
+            visited.add(current_point)
 
+            success = True
 
-        self.pathlist = path
-        return path
+            # =========================
+            # target に到達するまで
+            # =========================
+            while len(path) - 1 < selected_target_step:
+
+                current_step = len(path) - 1
+                remaining_to_target = selected_target_step - current_step
+
+                candidates: list[str] = []
+
+                for bit in range(self.Bit):
+                    next_point = flip_point(current_point, bit)
+
+                    if next_point in visited:
+                        continue
+
+                    next_remaining = remaining_to_target - 1
+                    dist_to_target = hamming(next_point, target)
+
+                    # 残りステップ数で target に届かないなら除外
+                    if dist_to_target > next_remaining:
+                        continue
+
+                    # 偶奇が合わないなら除外
+                    if dist_to_target % 2 != next_remaining % 2:
+                        continue
+
+                    # target_step より前に target に着くのは禁止
+                    if next_point == target and next_remaining != 0:
+                        continue
+
+                    candidates.append(next_point)
+
+                if not candidates:
+                    success = False
+                    break
+
+                current_point = random.choice(candidates)
+                path.append(current_point)
+                visited.add(current_point)
+
+            if not success:
+                continue
+
+            # 念のため確認
+            if current_point != target:
+                continue
+
+            # =========================
+            # target 到達後
+            # =========================
+            while len(path) - 1 < self.PL:
+
+                candidates: list[str] = []
+
+                for bit in range(self.Bit):
+                    next_point = flip_point(current_point, bit)
+
+                    if next_point in visited:
+                        continue
+
+                    candidates.append(next_point)
+
+                if not candidates:
+                    success = False
+                    break
+
+                current_point = random.choice(candidates)
+                path.append(current_point)
+                visited.add(current_point)
+
+            if not success:
+                continue
+
+            self.pathlist = path
+            return path
+
+        raise ValueError("条件を満たす simple path の生成に失敗しました")
 
     def get_random_data(self) -> list[str]:
         keys_list: list[int] = list(self.pm)
@@ -226,10 +287,17 @@ class client:
         next_stash: list[datablock] = []
 
         if target_blocks is not None:
-            root_position = "0" * self.Bit
-            if root_position in shuffled and shuffled[root_position].setblock(target_blocks):
-                self.pm[self.accessblock] = root_position
-            else:
+            target_positions = self.pathlist.copy()
+            random.shuffle(target_positions)
+            placed_target = False
+
+            for target_position in target_positions:
+                if shuffled[target_position].setblock(target_blocks):
+                    self.pm[self.accessblock] = target_position
+                    placed_target = True
+                    break
+
+            if not placed_target:
                 next_stash.append(target_blocks)
                 self.pm[self.accessblock] = 0
 
@@ -250,7 +318,7 @@ class client:
 
         root_first_positions: list[str] = sorted(
             self.pathlist,
-            key=lambda position: position.count("1")
+            key=lambda position: position.count("0")
         )
 
         for block_data in next_stash:
@@ -287,10 +355,101 @@ def statistical_distance(dist1, dist2) -> float:
         for k in keys
     )
 
-N: int = 256
-Bit: int = 9
-Z: int = 2
-PL: int = 11
+def plot_bucket_access_distribution(
+    random_log: list[str],
+    biased_log: list[str],
+    bit: int,
+    output_path: str = "cube_oram_bucket_access_distribution.png",
+) -> None:
+    import matplotlib.pyplot as plt
+
+    random_distribution = to_distribution(random_log)
+    biased_distribution = to_distribution(biased_log)
+    bucket_addresses = [format(i, f"0{bit}b") for i in range(2**bit)]
+    x_values = list(range(len(bucket_addresses)))
+
+    random_values = [
+        random_distribution.get(address, 0.0)
+        for address in bucket_addresses
+    ]
+    biased_values = [
+        biased_distribution.get(address, 0.0)
+        for address in bucket_addresses
+    ]
+    diff_values = [
+        biased_value - random_value
+        for random_value, biased_value in zip(random_values, biased_values)
+    ]
+
+    fig, (ax_distribution, ax_diff) = plt.subplots(
+        2,
+        1,
+        figsize=(14, 8),
+        sharex=True,
+        gridspec_kw={"height_ratios": [2, 1]},
+    )
+
+    bar_width = 0.42
+    ax_distribution.bar(
+        [x - bar_width / 2 for x in x_values],
+        random_values,
+        width=bar_width,
+        label="random access",
+        alpha=0.8,
+    )
+    ax_distribution.bar(
+        [x + bar_width / 2 for x in x_values],
+        biased_values,
+        width=bar_width,
+        label="biased access",
+        alpha=0.8,
+    )
+    ax_distribution.set_ylabel("Access probability")
+    ax_distribution.set_title("Cube ORAM bucket access distribution")
+    ax_distribution.legend()
+    ax_distribution.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
+
+    diff_colors = [
+        "tab:red" if value >= 0 else "tab:blue"
+        for value in diff_values
+    ]
+    ax_diff.bar(x_values, diff_values, color=diff_colors, alpha=0.85)
+    ax_diff.axhline(0, color="black", linewidth=0.8)
+    ax_diff.set_ylabel("Biased - random")
+    ax_diff.set_xlabel("Bucket address")
+    ax_diff.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
+
+    tick_step = max(1, len(bucket_addresses) // 32)
+    tick_positions = x_values[::tick_step]
+    ax_diff.set_xticks(tick_positions)
+    ax_diff.set_xticklabels(
+        [bucket_addresses[i] for i in tick_positions],
+        rotation=90,
+        fontsize=8,
+    )
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+    top_differences = sorted(
+        zip(bucket_addresses, random_values, biased_values, diff_values),
+        key=lambda item: abs(item[3]),
+        reverse=True,
+    )[:10]
+
+    print(f"saved bucket access distribution graph: {output_path}")
+    print("top bucket access differences:")
+    for address, random_value, biased_value, diff_value in top_differences:
+        print(
+            f"{address}: random={random_value:.8f}, "
+            f"biased={biased_value:.8f}, diff={diff_value:+.8f}"
+        )
+
+N: int = 64
+Bit: int = 5
+Z: int = 4
+PL: int = 7
 
 Window: int = 100
 
@@ -316,10 +475,10 @@ for i in range(1, N + 1):
         pm[addr] = 0
 
 
-print(cube)
-print(stash)
+#print(cube)
+#print(stash)
 
-print(pm)
+#print(pm)
 
 cube1: ORAMcube = copy.deepcopy(cube)
 cube2: ORAMcube = copy.deepcopy(cube)
@@ -339,7 +498,7 @@ oram_client2: client = client(pm2,stash2,Bit,Z,PL,Window)
 
 # random workflow--------------------------------------------------------------
 
-for i in range(10000):
+for i in range(100000):
     oram_client1.counter = oram_server1.give_counter()
     pathlist: list[str] = oram_client1.get_random_data()
     #print(pathlist)
@@ -351,10 +510,11 @@ for i in range(10000):
 
 # fixed address workflow--------------------------------------------------------------
 
-for i in range(10000):
+for i in range(100000):
     oram_client2.counter = oram_server2.give_counter()
-    #pathlist: list[str] = oram_client2.get_data(10)
-    pathlist: list[str] = oram_client2.get_random_data()
+    pathlist: list[str] = oram_client2.get_data(10)
+    print(pathlist)
+    #pathlist: list[str] = oram_client2.get_random_data()
     datalist: list[datablock] = oram_server2.getpath(pathlist)
     #print(datalist)
     shuffled: dict[str,bucket] = oram_client2.shuffle(datalist)
@@ -368,3 +528,9 @@ bucket_distribution2 = to_distribution(oram_server2.cube.bucket_log)
 
 print("statistical distance: bucket")
 print(statistical_distance(bucket_distribution1, bucket_distribution2))
+
+plot_bucket_access_distribution(
+    oram_server1.cube.bucket_log,
+    oram_server2.cube.bucket_log,
+    Bit,
+)

@@ -157,53 +157,100 @@ func (c *CubeClient) GetData(addr int) []int {
 	c.accessBlock = addr
 
 	pmPosition := c.PM[addr]
-	blockPosition := 0
+	target := 0
 	if pmPosition == 0 {
-		blockPosition = c.RNG.Intn(1 << c.Bit)
+		target = c.RNG.Intn(1 << c.Bit)
 	} else {
-		blockPosition = pmPosition - 1
+		target = pmPosition - 1
 	}
 
-	distance := 0
-	flipList := make([]int, 0, c.Bit)
-	for bit := 0; bit < c.Bit; bit++ {
-		mask := 1 << (c.Bit - bit - 1)
-		if blockPosition&mask != 0 {
-			distance++
-			flipList = append(flipList, bit)
+	root := 0
+	distance := bitsCount(root ^ target)
+	possibleTargetSteps := make([]int, 0, c.PL-distance+1)
+	if distance == 0 {
+		possibleTargetSteps = append(possibleTargetSteps, 0)
+	} else {
+		for step := distance; step <= c.PL; step++ {
+			if step%2 == distance%2 {
+				possibleTargetSteps = append(possibleTargetSteps, step)
+			}
 		}
 	}
-	c.RNG.Shuffle(len(flipList), func(i, j int) {
-		flipList[i], flipList[j] = flipList[j], flipList[i]
-	})
-
-	dif := c.PL - distance
-	path := make([]int, 0, c.PL+1)
-	visited := make(map[int]bool, c.PL+1)
-	last := 0
-
-	for _, bit := range flipList {
-		path = append(path, last)
-		visited[last] = true
-		last = flipHypercubeBit(last, bit, c.Bit)
+	if len(possibleTargetSteps) == 0 {
+		panic("cannot build a path through target with this PL")
 	}
 
-	path = append(path, last)
-	visited[last] = true
+	const maxRetry = 1000
+	for retry := 0; retry < maxRetry; retry++ {
+		selectedTargetStep := possibleTargetSteps[c.RNG.Intn(len(possibleTargetSteps))]
+		path := make([]int, 0, c.PL+1)
+		visited := make(map[int]bool, c.PL+1)
+		current := root
+		path = append(path, current)
+		visited[current] = true
+		success := true
 
-	for i := 0; i < dif; i++ {
-		candidates := unvisitedNeighbors(last, c.Bit, visited)
-		if len(candidates) == 0 {
-			panic("next point is missing")
+		for len(path)-1 < selectedTargetStep {
+			currentStep := len(path) - 1
+			remainingToTarget := selectedTargetStep - currentStep
+			candidates := make([]int, 0, c.Bit)
+
+			for bit := 0; bit < c.Bit; bit++ {
+				next := flipHypercubeBit(current, bit, c.Bit)
+				if visited[next] {
+					continue
+				}
+
+				nextRemaining := remainingToTarget - 1
+				distToTarget := bitsCount(next ^ target)
+				if distToTarget > nextRemaining {
+					continue
+				}
+				if distToTarget%2 != nextRemaining%2 {
+					continue
+				}
+				if next == target && nextRemaining != 0 {
+					continue
+				}
+
+				candidates = append(candidates, next)
+			}
+
+			if len(candidates) == 0 {
+				success = false
+				break
+			}
+
+			current = candidates[c.RNG.Intn(len(candidates))]
+			path = append(path, current)
+			visited[current] = true
 		}
 
-		last = candidates[c.RNG.Intn(len(candidates))]
-		visited[last] = true
-		path = append(path, last)
+		if !success || current != target {
+			continue
+		}
+
+		for len(path)-1 < c.PL {
+			candidates := unvisitedNeighbors(current, c.Bit, visited)
+			if len(candidates) == 0 {
+				success = false
+				break
+			}
+
+			current = candidates[c.RNG.Intn(len(candidates))]
+			path = append(path, current)
+			visited[current] = true
+		}
+
+		if !success {
+			continue
+		}
+
+		c.pathList = path
+		return path
 	}
 
-	c.pathList = path
-	return path
+	panic("failed to build a simple path")
 }
 
 func (c *CubeClient) GetRandomData() []int {
@@ -242,12 +289,23 @@ func (c *CubeClient) Shuffle(blocks []CubeDataBlock) map[int]CubeBucket {
 	nextStash := make([]CubeDataBlock, 0)
 
 	if hasTargetBlock {
-		rootPosition := 0
-		bucket := shuffled[rootPosition]
-		if bucket.SetBlock(targetBlock) {
-			shuffled[rootPosition] = bucket
-			c.PM[c.accessBlock] = rootPosition + 1
-		} else {
+		targetPositions := append([]int(nil), c.pathList...)
+		c.RNG.Shuffle(len(targetPositions), func(i, j int) {
+			targetPositions[i], targetPositions[j] = targetPositions[j], targetPositions[i]
+		})
+
+		placedTarget := false
+		for _, position := range targetPositions {
+			bucket := shuffled[position]
+			if bucket.SetBlock(targetBlock) {
+				shuffled[position] = bucket
+				c.PM[c.accessBlock] = position + 1
+				placedTarget = true
+				break
+			}
+		}
+
+		if !placedTarget {
 			nextStash = append(nextStash, targetBlock)
 			c.PM[c.accessBlock] = 0
 		}
