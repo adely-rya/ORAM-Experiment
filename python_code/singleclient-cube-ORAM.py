@@ -8,6 +8,8 @@ import math
 
 #random.seed(10)
 
+PMPosition = Optional[str]
+
 class ORAMcube:
     def __init__(self,Bit: int,Z: int,PL: int) -> None:
         self.Bit: int = Bit
@@ -25,8 +27,8 @@ class ORAMcube:
         
     def __repr__(self) -> str:
         result: str = ""
-        for k,v in self.cube.items():
-            result += f"{k}→{v} \n"
+        for k, v in self.cube.items():
+            result += f"{k}->{v} \n"
         return result
     
     def set_block(self, key: str,block: datablock) -> bool:
@@ -95,8 +97,8 @@ class server:
 
     
 class client:
-    def __init__(self, pm: dict[int, str | int], stash: list[datablock], Bit: int, Z: int, PL: int, window: int) -> None:
-        self.pm: dict[int, str | int] = pm
+    def __init__(self, pm: dict[int, PMPosition], stash: list[datablock], Bit: int, Z: int, PL: int, window: int) -> None:
+        self.pm: dict[int, PMPosition] = pm
         self.stash: list[datablock] = stash
 
         self.counter: int  = 0
@@ -117,11 +119,13 @@ class client:
 
         block_position = self.pm[addr]
 
-        if block_position == format(0, f"0{self.Bit}b"):
-            block_position = format(random.randrange(2**self.Bit), f"0{self.Bit}b")
+        root: str = "0" * self.Bit
+
+        if (block_position is None) or (block_position == root):
+            block_position = format(random.randrange(0,2**self.Bit), f"0{self.Bit}b")
 
         target: str = block_position
-        root: str = "0" * self.Bit
+        
 
         def hamming(a: str, b: str) -> int:
             return sum(x != y for x, y in zip(a, b))
@@ -254,87 +258,46 @@ class client:
         return self.get_data(random_key)
 
     def shuffle(self, blocks: list[datablock]) -> dict[str, bucket]:
+        if not self.pathlist:
+            raise ValueError("get_data or get_random_data must be called before shuffle")
 
         shuffled: dict[str, bucket] = {}
 
         all_blocks: list[datablock] = []
 
-        target_blocks: Optional[datablock] = None
-
-        for block_data in blocks:  
-            if block_data is None:
-                continue
-
-            if block_data.addr == self.accessblock:
-                target_blocks = block_data
-                continue
-            all_blocks.append(block_data)
-
-        for block_data in self.stash:
-            if block_data is None:
-                continue
-
-            if block_data.addr == self.accessblock:
-                target_blocks = block_data
-                continue
-            all_blocks.append(block_data)
-
-        self.stash = []
 
         for position in self.pathlist:
             shuffled[position] = bucket(self.Z)
 
-        next_stash: list[datablock] = []
+        for block in blocks:
+            all_blocks.append(block)
 
-        if target_blocks is not None:
-            target_positions = self.pathlist.copy()
-            random.shuffle(target_positions)
-            placed_target = False
+        for block in self.stash:
+            all_blocks.append(block)        
+        
+        key_list = list(shuffled.keys())
+        new_stash: list[datablock] = []
 
-            for target_position in target_positions:
-                if shuffled[target_position].setblock(target_blocks):
-                    self.pm[self.accessblock] = target_position
-                    placed_target = True
-                    break
+        for block in all_blocks:
+            available_keys = [
+                key for key in key_list
+                if len(shuffled[key].value) < self.Z
+            ]
 
-            if not placed_target:
-                next_stash.append(target_blocks)
-                self.pm[self.accessblock] = 0
-
-
-        for block_data in all_blocks:
-            block_position = self.pm[block_data.addr]
-
-            if block_position == 0 or block_position not in shuffled:
-                next_stash.append(block_data)
-                self.pm[block_data.addr] = 0
+            if not available_keys:
+                new_stash.append(block)
+                self.pm[block.addr] = None
                 continue
 
-            if not(shuffled[block_position].setblock(block_data)):
-                next_stash.append(block_data)
-                self.pm[block_data.addr] = 0
+            if self.accessblock == block.addr:
+                sorted_list = sorted(available_keys,key = lambda x: x.count("1"))
+                key = sorted_list[0]
+            else:
+                key = random.choice(available_keys)
+            shuffled[key].setblock(block)
+            self.pm[block.addr] = key
 
-        self.stash = []
-
-        root_first_positions: list[str] = sorted(
-            self.pathlist,
-            key=lambda position: position.count("0")
-        )
-
-        for block_data in next_stash:
-            placed = False
-
-            for position in root_first_positions:
-                if shuffled[position].setblock(block_data):
-                    self.pm[block_data.addr] = position
-                    placed = True
-                    break
-
-            if not placed:
-                self.stash.append(block_data)
-                self.pm[block_data.addr] = 0
-                
-
+        self.stash = new_stash
 
         return shuffled
 
@@ -446,14 +409,14 @@ def plot_bucket_access_distribution(
             f"biased={biased_value:.8f}, diff={diff_value:+.8f}"
         )
 
-N: int = 64
-Bit: int = 5
+N: int = 128
+Bit: int = 7
 Z: int = 4
-PL: int = 7
+PL: int = 10
 
 Window: int = 100
 
-pm: dict[int, str | int] = {}
+pm: dict[int, PMPosition] = {}
 stash: list[datablock] = []
 
 cube = ORAMcube(Bit,Z,PL)
@@ -472,7 +435,7 @@ for i in range(1, N + 1):
         pm[addr] = position
     else:
         stash.append(block)
-        pm[addr] = 0
+        pm[addr] = None
 
 
 #print(cube)
@@ -483,8 +446,8 @@ for i in range(1, N + 1):
 cube1: ORAMcube = copy.deepcopy(cube)
 cube2: ORAMcube = copy.deepcopy(cube)
 
-pm1: dict[int, str | int] = copy.deepcopy(pm)
-pm2: dict[int, str | int] = copy.deepcopy(pm)
+pm1: dict[int, PMPosition] = copy.deepcopy(pm)
+pm2: dict[int, PMPosition] = copy.deepcopy(pm)
 
 stash1: list[datablock] = copy.deepcopy(stash)
 stash2: list[datablock] = copy.deepcopy(stash)
@@ -494,7 +457,6 @@ oram_client1: client = client(pm1,stash1,Bit,Z,PL,Window)
 
 oram_server2: server = server(cube2)
 oram_client2: client = client(pm2,stash2,Bit,Z,PL,Window)
-
 
 # random workflow--------------------------------------------------------------
 
@@ -512,9 +474,11 @@ for i in range(100000):
 
 for i in range(100000):
     oram_client2.counter = oram_server2.give_counter()
-    pathlist: list[str] = oram_client2.get_data(10)
-    print(pathlist)
-    #pathlist: list[str] = oram_client2.get_random_data()
+    
+    if i > -1:
+        pathlist: list[str] = oram_client2.get_data(10)
+    else:
+        pathlist: list[str] = oram_client2.get_random_data()
     datalist: list[datablock] = oram_server2.getpath(pathlist)
     #print(datalist)
     shuffled: dict[str,bucket] = oram_client2.shuffle(datalist)
