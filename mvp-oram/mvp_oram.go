@@ -127,7 +127,7 @@ type path struct {
 }
 
 type ServerRequest interface {
-	handle(s *MvpSurver)
+	handle(s *MvpServer)
 }
 
 type GetpmRequest struct {
@@ -165,7 +165,7 @@ type EvictResponse struct {
 	Err error
 }
 
-type MvpSurver struct {
+type MvpServer struct {
 	PositionMaps []map[int][]MvpPosition
 	PathMaps     []path
 	Stashs       [][]MvpDataBlock
@@ -175,13 +175,23 @@ type MvpSurver struct {
 	Requests chan ServerRequest
 }
 
-func (s *MvpSurver) Run() {
+func NewMvpServer(tree MvpTree) *MvpServer {
+	return &MvpServer{
+		PositionMaps: make([]map[int][]MvpPosition, 0),
+		PathMaps:     make([]path, 0),
+		Stashs:       make([][]MvpDataBlock, 0),
+		tree:         tree,
+		Requests:     make(chan ServerRequest),
+	}
+}
+
+func (s *MvpServer) Run() {
 	for req := range s.Requests {
 		req.handle(s)
 	}
 }
 
-func (r GetpmRequest) handle(s *MvpSurver) {
+func (r GetpmRequest) handle(s *MvpServer) {
 	seq := s.counter
 	s.counter.increment()
 
@@ -190,11 +200,11 @@ func (r GetpmRequest) handle(s *MvpSurver) {
 	}
 }
 
-func (r GetpsRequest) handle(s *MvpSurver) {
+func (r GetpsRequest) handle(s *MvpServer) {
 	r.Reply <- GetpsResponse{}
 }
 
-func (r EvictReques) handle(s *MvpSurver) {
+func (r EvictReques) handle(s *MvpServer) {
 	r.Reply <- EvictResponse{}
 }
 
@@ -207,6 +217,17 @@ type MvpClient struct {
 
 	ClientID int
 	Server   chan<- ServerRequest
+}
+
+func NewMvpClient(clientID int, positionMap map[int][]MvpPosition, pathMaps []path, stash []MvpDataBlock, server chan<- ServerRequest) *MvpClient {
+	return &MvpClient{
+		PositionMap: positionMap,
+		PathMaps:    pathMaps,
+		Stash:       stash,
+		path:        make(map[MvpPosition][]MvpBucket),
+		ClientID:    clientID,
+		Server:      server,
+	}
 }
 
 func (c *MvpClient) GetPM() (Version, []path, error) {
