@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
 	"sort"
@@ -13,6 +14,17 @@ const (
 	mvpRootPosition   MvpPosition = "root"
 	mvpStashPosition  MvpPosition = "-1"
 	mvpInitialVersion Version     = 0
+)
+
+type OramOP struct {
+	OP     string
+	target int
+	param  string
+}
+
+const (
+	Write string = "write"
+	Read  string = "read"
 )
 
 func (p MvpPosition) String() string {
@@ -44,8 +56,9 @@ func (ver *Versions) SetS(value Version) {
 }
 
 type MvpDataBlock struct {
-	Addr int
-	Data string
+	Addr    int
+	Data    string
+	Version Versions
 }
 
 type MvpBucket struct {
@@ -70,6 +83,13 @@ func (b *MvpBucket) SetBlock(block MvpDataBlock) bool {
 	return true
 }
 
+func (b MvpBucket) Clone() MvpBucket {
+	return MvpBucket{
+		Z:     b.Z,
+		Value: append([]MvpDataBlock(nil), b.Value...),
+	}
+}
+
 type MvpBuckets struct {
 	Value map[Version]MvpBucket // バージョンを鍵にしたバケットS
 }
@@ -86,6 +106,17 @@ func NewMvpBuckets(z int) MvpBuckets {
 
 func (b *MvpBuckets) SetBucket(version Version, bucket MvpBucket) {
 	b.Value[version] = bucket
+}
+
+func (b MvpBuckets) Clone() MvpBuckets {
+	value := make(map[Version]MvpBucket, len(b.Value))
+	for version, bucket := range b.Value {
+		value[version] = bucket.Clone()
+	}
+
+	return MvpBuckets{
+		Value: value,
+	}
 }
 
 type MvpTree struct {
@@ -129,6 +160,26 @@ func NewMvpTree(z int, l int) MvpTree {
 	}
 }
 
+func (t MvpTree) Clone() MvpTree {
+	tree := make(map[MvpPosition]MvpBuckets, len(t.Tree))
+	for position, buckets := range t.Tree {
+		tree[position] = buckets.Clone()
+	}
+
+	bucketReadCount := make(map[MvpPosition]int64, len(t.BucketReadCount))
+	for position, count := range t.BucketReadCount {
+		bucketReadCount[position] = count
+	}
+
+	return MvpTree{
+		Z:               t.Z,
+		L:               t.L,
+		Tree:            tree,
+		BucketReadCount: bucketReadCount,
+		TotalBucketRead: t.TotalBucketRead,
+	}
+}
+
 type path struct {
 	addr int
 	from MvpPosition
@@ -159,14 +210,14 @@ type GetpsRequest struct {
 
 type GetpsResponse struct {
 	Path  map[MvpPosition]MvpBuckets
-	Stash []MvpDataBlock
+	Stash map[int][]MvpDataBlock
 	Err   error
 }
 
 type EvictReques struct {
 	ClientID int
 	PathMap  []path
-	Stash    []MvpDataBlock
+	Stash    map[int][]MvpDataBlock
 	Path     map[MvpPosition]MvpBuckets
 	Reply    chan EvictResponse
 }
@@ -175,13 +226,27 @@ type EvictResponse struct {
 	Err error
 }
 
+type OramState struct {
+	TreeState  MvpTree
+	StashState map[int][]MvpDataBlock
+}
+
+func cloneStashs(stashs map[int][]MvpDataBlock) map[int][]MvpDataBlock {
+	cloned := make(map[int][]MvpDataBlock, len(stashs))
+	for clientID, stash := range stashs {
+		cloned[clientID] = append([]MvpDataBlock(nil), stash...)
+	}
+
+	return cloned
+}
+
 type MvpServer struct {
 	PositionMaps  []map[int]MvpPosition
 	PathMaps      []path
-	Stashs        [][]MvpDataBlock
+	Stashs        map[int][]MvpDataBlock
 	tree          MvpTree
 	counter       Version
-	Snapshot      map[Version]MvpTree
+	Snapshot      map[int]OramState
 	Accesshistory map[int]Version
 
 	Requests chan ServerRequest
@@ -191,11 +256,11 @@ func NewMvpServer(z int, l int) *MvpServer {
 	return &MvpServer{
 		PositionMaps:  make([]map[int]MvpPosition, 0),
 		PathMaps:      make([]path, 0),
-		Stashs:        make([][]MvpDataBlock, 0),
+		Stashs:        make(map[int][]MvpDataBlock, 0),
 		tree:          NewMvpTree(z, l),
 		Requests:      make(chan ServerRequest),
 		counter:       mvpInitialVersion,
-		Snapshot:      make(map[Version]MvpTree, 50),
+		Snapshot:      make(map[int]OramState, 50),
 		Accesshistory: make(map[int]Version, 50),
 	}
 }
@@ -216,8 +281,13 @@ func (s *MvpServer) InitializeRandomData(n int, seed int64) map[int]MvpPosition 
 
 	for addr := 0; addr < n; addr++ {
 		block := MvpDataBlock{
-			Addr: int(addr),
+			Addr: addr,
 			Data: strconv.Itoa(addr),
+			Version: Versions{
+				V: mvpInitialVersion,
+				A: mvpInitialVersion,
+				S: mvpInitialVersion,
+			},
 		}
 		position := positions[rng.Intn(len(positions))] //ランダムにポジションを選ぶ
 		buckets := s.tree.Tree[position]
@@ -235,7 +305,7 @@ func (s *MvpServer) InitializeRandomData(n int, seed int64) map[int]MvpPosition 
 	}
 
 	s.PositionMaps = append(s.PositionMaps, positionMap)
-	s.Stashs = append(s.Stashs, stash)
+	s.Stashs[0] = stash
 
 	return positionMap
 
@@ -262,14 +332,18 @@ func (r GetpmRequest) handle(s *MvpServer) {
 		lastVersion = v
 	}
 
-	difpathMap := make([]path, 100)
+	difpathMap := make([]path, 0, len(s.PathMaps))
 	for _, v := range s.PathMaps {
 		if v.Ver > lastVersion {
 			difpathMap = append(difpathMap, v)
 		}
 	}
 
-	s.Snapshot[seq] = s.tree
+	s.Snapshot[r.ClientID] = OramState{
+		TreeState:  s.tree.Clone(),
+		StashState: cloneStashs(s.Stashs),
+	}
+	s.Accesshistory[r.ClientID] = seq
 
 	r.Reply <- GetpmResponse{
 		Seq:     seq,
@@ -279,7 +353,28 @@ func (r GetpmRequest) handle(s *MvpServer) {
 }
 
 func (r GetpsRequest) handle(s *MvpServer) {
-	r.Reply <- GetpsResponse{}
+	oramstate, ok := s.Snapshot[r.ClientID]
+	if !ok {
+		r.Reply <- GetpsResponse{
+			Err: fmt.Errorf("snapshot for client %d not found", r.ClientID),
+		}
+		return
+	}
+
+	path := make(map[MvpPosition]MvpBuckets, s.tree.L+1)
+	path[mvpRootPosition] = oramstate.TreeState.Tree[mvpRootPosition]
+
+	leaf := r.Leaf.String()
+	for len(leaf) != 0 {
+		path[MvpPosition(leaf)] = oramstate.TreeState.Tree[MvpPosition(leaf)]
+		leaf = leaf[:len(leaf)-1]
+	}
+
+	r.Reply <- GetpsResponse{
+		Path:  path,
+		Stash: oramstate.StashState,
+		Err:   nil,
+	}
 }
 
 func (r EvictReques) handle(s *MvpServer) {
@@ -289,7 +384,7 @@ func (r EvictReques) handle(s *MvpServer) {
 type MvpClient struct {
 	L           int
 	PositionMap map[int]MvpPosition
-	Stash       []MvpDataBlock
+	Stash       map[int][]MvpDataBlock
 	path        map[MvpPosition]MvpBuckets
 
 	ClientID int
@@ -317,7 +412,7 @@ func (c *MvpClient) GetPM() (Version, []path, error) {
 	return res.Seq, res.PathMap, res.Err
 }
 
-func (c *MvpClient) GetPS(leaf MvpPosition) (map[MvpPosition]MvpBuckets, []MvpDataBlock, error) {
+func (c *MvpClient) GetPS(leaf MvpPosition) (map[MvpPosition]MvpBuckets, map[int][]MvpDataBlock, error) {
 	reply := make(chan GetpsResponse)
 
 	c.Server <- GetpsRequest{
@@ -330,7 +425,7 @@ func (c *MvpClient) GetPS(leaf MvpPosition) (map[MvpPosition]MvpBuckets, []MvpDa
 	return res.Path, res.Stash, res.Err
 }
 
-func (c *MvpClient) Evict(path map[MvpPosition]MvpBuckets, pathmap []path, stash []MvpDataBlock) error {
+func (c *MvpClient) Evict(path map[MvpPosition]MvpBuckets, pathmap []path, stash map[int][]MvpDataBlock) error {
 	reply := make(chan EvictResponse)
 
 	c.Server <- EvictReques{
@@ -350,7 +445,8 @@ func (c *MvpClient) Run() error {
 	log.Println("Client is running")
 
 	for {
-		err := c.Access(100)
+
+		err := c.Access(OramOP{Write, 100, "hoge"})
 		if err != nil {
 			panic(err)
 		}
@@ -361,8 +457,8 @@ func (c *MvpClient) Run() error {
 	return nil
 }
 
-func (c *MvpClient) Access(addr int) error {
-	version, pathMaps, err := c.GetPM()
+func (c *MvpClient) Access(op OramOP) error {
+	version, pathMaps, err := c.GetPM() //Getpm操作
 	if err != nil {
 		return err
 	}
@@ -370,19 +466,39 @@ func (c *MvpClient) Access(addr int) error {
 	c.consolidatePathMaps(pathMaps) //position mapの更新
 
 	log.Println("version is ", version)
-	log.Println("Access block's leaf is ", c.PositionMap[addr])
+	log.Println("Access block's leaf is ", c.PositionMap[op.target])
 
-	accessPosition := c.PositionMap[addr]
+	accessPosition := c.PositionMap[op.target]
 
 	log.Println(selectPath(accessPosition, c.L))
 
-	c.path, c.Stash, err = c.GetPS(selectPath(accessPosition, c.L))
+	c.path, c.Stash, err = c.GetPS(selectPath(accessPosition, c.L)) //Getps操作
 	if err != nil {
 		return err
 	}
 
 	log.Println(c.path)
 	log.Println(c.Stash)
+
+	W := c.mergePathStashes() //ワーキングセット制作
+
+	log.Println(W)
+
+	targetBlock, ok := W[op.target]
+	if !ok {
+		return fmt.Errorf("Not target block in working set")
+	}
+
+	log.Println(targetBlock)
+	if op.OP == Write {
+		targetBlock.Data = op.param
+		targetBlock.Version = Versions{version, version, version}
+	} else {
+		targetBlock.Version.SetA(version)
+		targetBlock.Version.SetS(version)
+	}
+	W[op.target] = targetBlock
+	log.Println(targetBlock)
 
 	return nil
 }
@@ -410,6 +526,30 @@ func selectPath(accessPosition MvpPosition, pathlen int) MvpPosition {
 	}
 
 	return MvpPosition(leaf)
+}
+
+func (c *MvpClient) mergePathStashes() map[int]MvpDataBlock {
+	W := make(map[int]MvpDataBlock, 0)
+
+	for _, v := range c.Stash {
+		for _, block := range v {
+			if mvpStashPosition == c.PositionMap[block.Addr] {
+				W[block.Addr] = block
+			}
+		}
+	}
+
+	for position, buckets := range c.path {
+		for _, bucket := range buckets.Value {
+			for _, block := range bucket.Value {
+				if position == c.PositionMap[block.Addr] {
+					W[block.Addr] = block
+				}
+			}
+		}
+	}
+
+	return W
 }
 
 func main() {
