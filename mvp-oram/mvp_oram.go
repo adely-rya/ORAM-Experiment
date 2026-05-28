@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"sort"
 	"strconv"
+	"time"
 )
 
 type MvpBucketPosition string
@@ -461,6 +462,8 @@ type MvpClient struct {
 
 	ClientID int
 	Server   chan<- ServerRequest
+
+	seq Version
 }
 
 func NewMvpClient(l int, z int, clientID int, positionmap map[int]MvpPosition, server chan<- ServerRequest) *MvpClient {
@@ -532,6 +535,7 @@ func (c *MvpClient) Run() error {
 
 func (c *MvpClient) Access(op OramOP) error {
 	version, pathMaps, err := c.GetPM() //Getpm操作
+	c.seq = version
 	if err != nil {
 		return err
 	}
@@ -650,10 +654,52 @@ func sort_block(blockList []MvpDataBlock) []MvpDataBlock {
 	return blockList
 }
 
-func (c *MvpClient) populatePath(W map[int]MvpDataBlock, version Version) (map[MvpPosition]MvpBucket, map[int][]MvpDataBlock, []path) {
-	populatedPath := make(map[MvpPosition]MvpBucket, c.L+1)
+func Randomchoice(target []MvpPosition, n int) []MvpPosition {
+	if n > len(target) {
+		n = len(target)
+	}
+
+	result := make([]MvpPosition, 0, n)
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	indexes := rng.Perm(len(target))
+
+	for i := 0; i < n; i++ {
+		result = append(result, target[indexes[i]])
+	}
+
+	return result
+}
+
+func (c *MvpClient) populatePath(W map[int]MvpDataBlock) (map[MvpPosition]MvpSlot, map[int][]MvpDataBlock, []path) {
+	populatedPath := make(map[MvpPosition]MvpSlot, c.L+1)
 	populatedStash := make(map[int][]MvpDataBlock, 20)
 	populatedPathMap := make([]path, 0, len(W))
+
+	positions := make([]MvpPosition, c.L*4)
+	for position := range c.path {
+		for i := 0; i < c.Z; i++ {
+			mp := MvpPosition{position, MvpSlotPosition(i)}
+			positions = append(positions, mp)
+
+			candinates := make([]MvpDataBlock, 0, len(W))
+			for _, block := range W {
+				if c.PositionMap[block.Addr] == mp {
+					candinates = append(candinates, block)
+				}
+			}
+
+			if len(candinates) == 0 {
+				populatedPath[mp] = NewMvpSlot(c.seq)
+				continue
+			}
+
+			candinates = sort_block(candinates)
+			slot := NewMvpSlot(c.seq)
+			slot.SetBlock(candinates[0])
+			populatedPath[mp] = slot
+		}
+	}
 
 	return populatedPath, populatedStash, populatedPathMap
 }

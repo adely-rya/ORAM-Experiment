@@ -152,7 +152,7 @@ func NewCubeClient(pm []int, stash []CubeDataBlock, bit, z, pl int, rng *rand.Ra
 	}
 }
 
-func (c *CubeClient) GetData(addr int) []int {
+func (c *CubeClient) GetData_alg1(addr int) []int { //adelyが考えたアルゴリズム
 	c.accessBlock = addr
 
 	root := 0
@@ -247,8 +247,56 @@ func (c *CubeClient) GetData(addr int) []int {
 	panic("failed to build a simple path")
 }
 
+func (c *CubeClient) GetData(addr int) []int {
+	return c.GetData_alg1(addr)
+}
+
+func (c *CubeClient) GetData_alg2(addr int) []int { //adelyが考えたアルゴリズム
+	c.accessBlock = addr
+
+	root := 0
+	target := c.PM[addr]
+	if target == stashPosition || target == root {
+		target = c.RNG.Intn(1 << c.Bit)
+	}
+
+	for {
+		path := make([]int, 0, c.PL+1)
+		visited := make(map[int]bool, 0)
+		current := 0
+		success := true
+
+		path = append(path, current)
+		visited[current] = true
+
+		for len(path) < c.PL+1 {
+			candidates := unvisitedNeighbors(current, c.Bit, visited)
+			if len(candidates) == 0 {
+				success = false
+				break
+			}
+
+			current = candidates[c.RNG.Intn(len(candidates))]
+			path = append(path, current)
+			visited[current] = true
+		}
+
+		if !success {
+			continue
+		}
+
+		for _, n := range path {
+			if n == target {
+				c.pathList = path
+				return path
+			}
+		}
+	}
+
+}
+
 func (c *CubeClient) GetRandomData() []int {
-	return c.GetData(1 + c.RNG.Intn(len(c.PM)-1))
+	return c.GetData_alg1(1 + c.RNG.Intn(len(c.PM)-1))
 }
 
 func (c *CubeClient) Shuffle(blocks []CubeDataBlock) map[int]CubeBucket {
