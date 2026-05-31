@@ -307,7 +307,6 @@ type EvictResponse struct {
 type OramState struct {
 	TreeState  MvpTree
 	StashState map[int][]MvpDataBlock
-	Pathmap    []path
 }
 
 func cloneStashs(stashs map[int][]MvpDataBlock) map[int][]MvpDataBlock {
@@ -425,12 +424,11 @@ func (r GetpmRequest) handle(s *MvpServer) {
 	s.Snapshot[r.ClientID] = OramState{
 		TreeState:  s.tree.Clone(),
 		StashState: cloneStashs(s.Stashs),
-		Pathmap:    s.PathMaps,
 	}
 
-	difpathMap := make([]path, 0, len(s.Snapshot[r.ClientID].Pathmap))
+	difpathMap := make([]path, 0, len(s.PathMaps))
 	maxIncludedSeq := lastVersion
-	for _, v := range s.Snapshot[r.ClientID].Pathmap {
+	for _, v := range s.PathMaps {
 		if v.Seq >= lastVersion {
 			difpathMap = append(difpathMap, v)
 		}
@@ -682,8 +680,9 @@ func (c *MvpClient) mergePathStashes() map[int]MvpDataBlock {
 
 	for _, v := range c.Stash {
 		for _, block := range v {
-			if mvpStashPosition == c.PositionMap[block.Addr].Slot {
-				setLatestBlock(W, block)
+			pm, ok := c.PositionMap[block.Addr]
+			if ok && pm.Slot == mvpStashPosition && pm.Ts == block.Version {
+				W[block.Addr] = block
 			}
 		}
 	}
@@ -696,21 +695,16 @@ func (c *MvpClient) mergePathStashes() map[int]MvpDataBlock {
 				}
 
 				block := slot.Value
-				if c.PositionMap[block.Addr].Slot == (MvpPosition{bucket: bucketPosition, slot: slotPosition}) {
-					setLatestBlock(W, block)
+				pm, ok := c.PositionMap[block.Addr]
+				blockPosition := MvpPosition{bucket: bucketPosition, slot: slotPosition}
+				if ok && pm.Slot == blockPosition && pm.Ts == block.Version {
+					W[block.Addr] = block
 				}
 			}
 		}
 	}
 
 	return W
-}
-
-func setLatestBlock(blocks map[int]MvpDataBlock, block MvpDataBlock) {
-	current, ok := blocks[block.Addr]
-	if !ok || newerVersions(block.Version, current.Version) {
-		blocks[block.Addr] = block
-	}
 }
 
 func newerVersions(left Versions, right Versions) bool {
