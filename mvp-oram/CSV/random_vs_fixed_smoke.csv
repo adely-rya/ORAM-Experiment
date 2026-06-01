@@ -1,0 +1,2 @@
+accesses,n,l,z,fixed_addr,initial_seed,pathmap_compact_every,pathmap_compact_protected_tail,run1_seed,run2_seed,run3_seed,run1_total_bucket_reads,run2_total_bucket_reads,run3_total_bucket_reads,random_vs_random_distance,random_vs_fixed_distance,elapsed_ms
+10,32,5,4,7,542,5,3,563,564,565,60,60,60,0.1666666667,0.3666666667,5

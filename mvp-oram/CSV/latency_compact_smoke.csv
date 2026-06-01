@@ -1,0 +1,3 @@
+accesses,window_start,window_end,n,l,z,seed,pathmap_compact_every,window_min_ns,window_mean_ns,window_p50_ns,window_p90_ns,window_p95_ns,window_p99_ns,window_max_ns,cumulative_mean_ns,cumulative_p95_ns,total_bucket_reads,elapsed_ms
+10,1,10,64,6,4,542,10,104159,361158.40,124081,342149,2107164,2107164,2107164,361158.40,2107164,70,3
+100,11,100,64,6,4,542,10,98497,202253.59,121525,409948,492417,1060853,1060853,218144.07,492417,700,22

@@ -13,10 +13,12 @@ type MvpBucketPosition string
 type MvpSlotPosition int
 
 const (
-	mvpRootBucketPosition  MvpBucketPosition = "root"
-	mvpStashBucketPosition MvpBucketPosition = "-1"
-	mvpStashSlotPosition   MvpSlotPosition   = -1
-	mvpInitialVersion      Version           = 0
+	mvpRootBucketPosition                 MvpBucketPosition = "root"
+	mvpStashBucketPosition                MvpBucketPosition = "-1"
+	mvpStashSlotPosition                  MvpSlotPosition   = -1
+	mvpInitialVersion                     Version           = 0
+	mvpDefaultPathMapCompactInterval                        = 10000
+	mvpDefaultPathMapCompactProtectedTail                   = 2000
 )
 
 var (
@@ -248,6 +250,11 @@ func (t MvpTree) Clone() MvpTree {
 	}
 }
 
+func (t *MvpTree) CountBucketRead(position MvpBucketPosition) {
+	t.BucketReadCount[position]++
+	t.TotalBucketRead++
+}
+
 type path struct {
 	addr int
 	to   MvpPosition
@@ -328,13 +335,16 @@ func clonePositionMap(positionMap map[int]MvpPositionMapEntry) map[int]MvpPositi
 }
 
 type MvpServer struct {
-	PositionMaps  []map[int]MvpPositionMapEntry
-	PathMaps      []path
-	Stashs        map[int][]MvpDataBlock
-	tree          MvpTree
-	counter       Version
-	Snapshot      map[int]OramState
-	Accesshistory map[int]Version
+	PositionMaps                 []map[int]MvpPositionMapEntry
+	PathMaps                     []path
+	Stashs                       map[int][]MvpDataBlock
+	tree                         MvpTree
+	counter                      Version
+	Snapshot                     map[int]OramState
+	PathMapCursor                map[int]int
+	PathMapCompactInterval       int
+	PathMapCompactProtectedTail  int
+	pathMapEvictsSinceCompaction int
 
 	Requests chan ServerRequest
 }
@@ -348,8 +358,65 @@ func NewMvpServer(z int, l int) *MvpServer {
 		Requests:      make(chan ServerRequest),
 		counter:       mvpInitialVersion,
 		Snapshot:      make(map[int]OramState, 50),
-		Accesshistory: make(map[int]Version, 50),
+		PathMapCursor: make(map[int]int, 50),
+
+		PathMapCompactInterval:      mvpDefaultPathMapCompactInterval,
+		PathMapCompactProtectedTail: mvpDefaultPathMapCompactProtectedTail,
 	}
+}
+
+func (s *MvpServer) SetPathMapCompaction(interval int, protectedTail int) {
+	s.PathMapCompactInterval = interval
+	s.PathMapCompactProtectedTail = protectedTail
+	s.pathMapEvictsSinceCompaction = 0
+}
+
+func (s *MvpServer) compactPathMaps() {
+	if len(s.PathMaps) == 0 || s.PathMapCompactProtectedTail <= 0 {
+		return
+	}
+
+	compactEnd := len(s.PathMaps) - s.PathMapCompactProtectedTail
+	if compactEnd <= 0 {
+		return
+	}
+
+	addrInProtectedTail := make(map[int]struct{}, s.PathMapCompactProtectedTail)
+	for _, entry := range s.PathMaps[compactEnd:] {
+		addrInProtectedTail[entry.addr] = struct{}{}
+	}
+	if len(addrInProtectedTail) == 0 {
+		return
+	}
+
+	removedPrefix := make([]int, len(s.PathMaps)+1)
+	compacted := make([]path, 0, len(s.PathMaps))
+	for index, entry := range s.PathMaps {
+		removedPrefix[index+1] = removedPrefix[index]
+		if index < compactEnd {
+			if _, ok := addrInProtectedTail[entry.addr]; ok {
+				removedPrefix[index+1]++
+				continue
+			}
+		}
+		compacted = append(compacted, entry)
+	}
+
+	if len(compacted) == len(s.PathMaps) {
+		return
+	}
+
+	for clientID, cursor := range s.PathMapCursor {
+		if cursor < 0 {
+			cursor = 0
+		}
+		if cursor > len(s.PathMaps) {
+			cursor = len(s.PathMaps)
+		}
+		s.PathMapCursor[clientID] = cursor - removedPrefix[cursor]
+	}
+
+	s.PathMaps = compacted
 }
 
 func (s *MvpServer) InitializeRandomData(n int, seed int64) map[int]MvpPositionMapEntry {
@@ -415,29 +482,18 @@ func (r GetpmRequest) handle(s *MvpServer) {
 	s.counter.increment()
 	seq := s.counter
 
-	v, ok := s.Accesshistory[r.ClientID]
-	lastVersion := Version(0)
-	if ok {
-		lastVersion = v
-	}
-
 	s.Snapshot[r.ClientID] = OramState{
 		TreeState:  s.tree.Clone(),
 		StashState: cloneStashs(s.Stashs),
 	}
 
-	difpathMap := make([]path, 0, len(s.PathMaps))
-	maxIncludedSeq := lastVersion
-	for _, v := range s.PathMaps {
-		if v.Seq >= lastVersion {
-			difpathMap = append(difpathMap, v)
-		}
-		if v.Seq > maxIncludedSeq {
-			maxIncludedSeq = v.Seq
-		}
+	cursor := s.PathMapCursor[r.ClientID]
+	if cursor < 0 || cursor > len(s.PathMaps) {
+		cursor = len(s.PathMaps)
 	}
 
-	s.Accesshistory[r.ClientID] = maxIncludedSeq
+	difpathMap := append([]path(nil), s.PathMaps[cursor:]...)
+	s.PathMapCursor[r.ClientID] = len(s.PathMaps)
 
 	r.Reply <- GetpmResponse{
 		Seq:     seq,
@@ -457,11 +513,13 @@ func (r GetpsRequest) handle(s *MvpServer) {
 
 	path := make(map[MvpBucketPosition]MvpBucket, s.tree.L+1)
 	path[mvpRootBucketPosition] = oramstate.TreeState.Tree[mvpRootBucketPosition]
+	s.tree.CountBucketRead(mvpRootBucketPosition)
 
 	leaf := r.Leaf.bucket.String()
 	for len(leaf) != 0 {
 		bucketPosition := MvpBucketPosition(leaf)
 		path[bucketPosition] = oramstate.TreeState.Tree[bucketPosition]
+		s.tree.CountBucketRead(bucketPosition)
 		leaf = leaf[:len(leaf)-1]
 	}
 
@@ -505,6 +563,11 @@ func (r EvictReques) handle(s *MvpServer) {
 
 	for _, path := range r.PathMap {
 		s.PathMaps = append(s.PathMaps, path)
+	}
+	s.pathMapEvictsSinceCompaction++
+	if s.PathMapCompactInterval > 0 && s.pathMapEvictsSinceCompaction >= s.PathMapCompactInterval {
+		s.compactPathMaps()
+		s.pathMapEvictsSinceCompaction = 0
 	}
 
 	r.Reply <- EvictResponse{
@@ -606,7 +669,7 @@ func (c *MvpClient) Access(op OramOP) error {
 
 	accessPosition := c.PositionMap[op.target].Slot
 
-	c.path, c.Stash, err = c.GetPS(selectPath(accessPosition, c.L)) //Getps操作
+	c.path, c.Stash, err = c.GetPS(c.selectPath(accessPosition, c.L)) //Getps操作
 	if err != nil {
 		return err
 	}
@@ -656,8 +719,37 @@ func (c *MvpClient) consolidatePathMaps(pathMaps []path) {
 	}
 }
 
+func (c *MvpClient) selectPath(accessPosition MvpPosition, pathlen int) MvpPosition {
+	if accessPosition == mvpStashPosition || accessPosition.bucket == mvpRootBucketPosition {
+		accessPosition = c.randomPositionMapSlot()
+	}
+
+	return selectPath(accessPosition, pathlen)
+}
+
+func (c *MvpClient) randomPositionMapSlot() MvpPosition {
+	if len(c.PositionMap) == 0 {
+		return MvpPosition{}
+	}
+
+	fakeTargetAddr := rand.Intn(len(c.PositionMap))
+	if entry, ok := c.PositionMap[fakeTargetAddr]; ok {
+		return entry.Slot
+	}
+
+	index := rand.Intn(len(c.PositionMap))
+	for _, entry := range c.PositionMap {
+		if index == 0 {
+			return entry.Slot
+		}
+		index--
+	}
+
+	return MvpPosition{}
+}
+
 func selectPath(accessPosition MvpPosition, pathlen int) MvpPosition {
-	if accessPosition == mvpStashPosition || accessPosition == mvpRootPosition {
+	if accessPosition == mvpStashPosition || accessPosition.bucket == mvpRootBucketPosition {
 		accessPosition = MvpPosition{}
 	}
 
@@ -762,6 +854,7 @@ func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosi
 	populatedPath := make(map[MvpPosition]MvpSlot, c.L+1)
 	populatedStash := make([]MvpDataBlock, 0, 20)
 	populatedPathMap := make([]path, 0, len(W))
+	targetPosition := c.PositionMap[op.target].Slot
 
 	used_slot := make([]MvpPosition, 0, c.L*4)
 	for position := range c.path {
@@ -794,17 +887,18 @@ func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosi
 		}
 	}
 
-	swap_cadinate := make([]MvpDataBlock, 0, c.Z)
-	if len(W) <= c.Z {
-		for _, block := range W {
-			swap_cadinate = append(swap_cadinate, block)
+	blockList := make([]MvpDataBlock, 0, len(W))
+	for _, block := range W {
+		if block.Addr == op.target {
+			continue
 		}
-	} else {
-		blockList := make([]MvpDataBlock, 0, len(W))
-		for _, block := range W {
-			blockList = append(blockList, block)
-		}
+		blockList = append(blockList, block)
+	}
 
+	swap_cadinate := make([]MvpDataBlock, 0, c.Z)
+	if len(blockList) <= c.Z {
+		swap_cadinate = append(swap_cadinate, blockList...)
+	} else {
 		for _, index := range rand.Perm(len(blockList))[:c.Z] {
 			swap_cadinate = append(swap_cadinate, blockList[index])
 		}
@@ -812,9 +906,11 @@ func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosi
 
 	swap_slot := make([]MvpPosition, 0, c.Z)
 	swapSlotSet := make(map[MvpPosition]bool, c.Z)
-	if c.PositionMap[op.target].Slot != mvpStashPosition {
-		swap_slot = append(swap_slot, c.PositionMap[op.target].Slot)
-		swapSlotSet[c.PositionMap[op.target].Slot] = true
+	if targetPosition != mvpStashPosition {
+		if _, ok := populatedPath[targetPosition]; ok {
+			swap_slot = append(swap_slot, targetPosition)
+			swapSlotSet[targetPosition] = true
+		}
 	}
 	for _, index := range rand.Perm(len(used_slot)) {
 		if len(swap_slot) >= c.Z {
@@ -880,40 +976,4 @@ func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosi
 	}
 
 	return populatedPath, populatedStash, populatedPathMap
-}
-
-func main() {
-	const (
-		z           = 4
-		l           = 8
-		n           = 256
-		seed        = 542
-		clientCount = 40
-	)
-
-	server := NewMvpServer(z, l)
-	positionmap := server.InitializeRandomData(n, seed)
-
-	go server.Run()
-
-	errs := make(chan error, clientCount)
-	for clientID := 0; clientID < clientCount; clientID++ {
-		client := NewMvpClient(
-			l,
-			z,
-			clientID,
-			clonePositionMap(positionmap),
-			server.Requests,
-		)
-
-		go func(client *MvpClient) {
-			if err := client.Run(n); err != nil {
-				errs <- fmt.Errorf("client %d stopped: %w", client.ClientID, err)
-			}
-		}(client)
-	}
-
-	if err := <-errs; err != nil {
-		panic(err)
-	}
 }
