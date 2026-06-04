@@ -1,4 +1,4 @@
-// Synchronized Monte Carlo experiment for leaf access distributions.
+// Monte Carlo experiment for same-address concurrent leaf selection.
 package main
 
 import (
@@ -14,30 +14,25 @@ import (
 
 const (
 	z          = 4
-	l          = 8
-	n          = 256
+	l          = 12
+	n          = 1 << 12
 	seed       = 542
-	WarmUp     = 10
-	MonteCarlo = 10000
+	WarmUp     = 200
+	MonteCarlo = 2000000
 	minClient  = 1
-	maxClient  = 50
+	maxClient  = 20
 )
 
-// var experiment1Alphas = []float32{0.90436, 1.0945, 1.2353, 1.537}
-var experiment1Alphas = []float32{0.1}
+var experimentAlphas = []float32{0.1, 1.8}
 var zipfGeneratorRand = rand.New(rand.NewSource(time.Now().UnixNano()))
 var zipfGeneratorMu sync.Mutex
 
 type client_set struct {
 	client           *MvpClient
 	selectedPosition MvpPosition
-	populatePath     map[MvpPosition]MvpSlot
-	populateStash    []MvpDataBlock
-	populatedPathMap []path
-	ready            bool
 }
 
-type experiment1Result struct {
+type experimentResult struct {
 	clientCount int
 	alpha       float32
 	distance    float64
@@ -47,22 +42,26 @@ func NewCientSet(client *MvpClient) *client_set {
 	return &client_set{client: client}
 }
 
-func Experiment1() {
-	clientCounts := experiment1ClientCounts(minClient, maxClient)
-	results := make(chan experiment1Result, len(clientCounts)*len(experiment1Alphas))
+func Experiment3() {
+	clientCounts := experimentClientCounts(minClient, maxClient)
+	results := make(chan experimentResult, len(clientCounts)*len(experimentAlphas))
 
 	var experimentwg sync.WaitGroup
 	for _, clientCount := range clientCounts {
-		for _, alpha := range experiment1Alphas {
+		for _, alpha := range experimentAlphas {
 			experimentwg.Add(1)
-			go leafDistribution(alpha, clientCount, results, &experimentwg)
+			go sharedAddressLeafDistribution(alpha, clientCount, results, &experimentwg)
 		}
 	}
 
 	experimentwg.Wait()
 	close(results)
 
-	ordered := make([]experiment1Result, 0, len(clientCounts)*len(experiment1Alphas))
+	printExperimentDistanceResults(results, len(clientCounts)*len(experimentAlphas))
+}
+
+func printExperimentDistanceResults(results <-chan experimentResult, resultCount int) {
+	ordered := make([]experimentResult, 0, resultCount)
 	for result := range results {
 		ordered = append(ordered, result)
 	}
@@ -79,8 +78,8 @@ func Experiment1() {
 	}
 }
 
-// Build the requested client-count series: 1, then 5, 10, ... up to maxClient.
-func experiment1ClientCounts(minClient int, maxClient int) []int {
+// Build the client-count series: 1 if requested, then 5, 10, ... up to maxClient.
+func experimentClientCounts(minClient int, maxClient int) []int {
 	clientCounts := make([]int, 0)
 	if minClient <= 1 && maxClient >= 1 {
 		clientCounts = append(clientCounts, 1)
@@ -93,8 +92,8 @@ func experiment1ClientCounts(minClient int, maxClient int) []int {
 	return clientCounts
 }
 
-// Run one independent alpha/client-count experiment from the same initial server state.
-func leafDistribution(alpha float32, clientCount int, results chan<- experiment1Result, experimentwg *sync.WaitGroup) {
+// Warm up with one client, then measure leaves when all clients access one shared Zipf address per trial.
+func sharedAddressLeafDistribution(alpha float32, clientCount int, results chan<- experimentResult, experimentwg *sync.WaitGroup) {
 	defer experimentwg.Done()
 
 	server := NewSynchronizedMvpServer(z, l)
@@ -103,53 +102,64 @@ func leafDistribution(alpha float32, clientCount int, results chan<- experiment1
 
 	clients := make([]*client_set, 0, clientCount)
 	for clientID := 0; clientID < clientCount; clientID++ {
-		client := NewMvpClient(
-			l,
-			z,
-			clientID,
-			clonePositionMap(positionmap),
-			server.Requests,
-		)
+		client := NewMvpClient(l, z, clientID, clonePositionMap(positionmap), server.Requests)
 		clients = append(clients, NewCientSet(client))
 	}
 
-	// Warm up the synchronized ORAM state without recording selected leaves.
+	// Warm up the ORAM state with a single client using Zipf-selected addresses.
 	for i := 0; i < WarmUp; i++ {
-		runSynchronizedTrial(clients, alpha)
+		op := opgenerater(alpha, len(clients[0].client.PositionMap)-1)
+		if err := clients[0].client.Access(op); err != nil {
+			log.Printf("warmup access error: %v", err)
+			return
+		}
 	}
 
-	// Count the number of distinct leaves selected in each Monte Carlo trial.
+	// Pull warmup PathMaps so every measuring client starts from the same PositionMap.
+	syncClientPositionMaps(clients)
+
+	// Count distinct leaves when all clients access the same Zipf-selected address.
 	observedDistribution := makeKDistribution(clientCount)
 	for i := 0; i < MonteCarlo; i++ {
-		leaves := runSynchronizedTrial(clients, alpha)
+		op := opgenerater(alpha, len(clients[0].client.PositionMap)-1)
+		leaves := runSharedAddressGetPSOnlyTrial(clients, op)
 		observedDistribution[countDistinctLeaves(leaves)]++
 	}
 
 	randomDistribution := makeRandomKDistribution(l, clientCount, MonteCarlo, seed+int64(clientCount)*1000003+int64(alpha*1000))
 
-	results <- experiment1Result{
+	results <- experimentResult{
 		clientCount: clientCount,
 		alpha:       alpha,
 		distance:    statisticalDistance(observedDistribution, randomDistribution),
 	}
 }
 
-// Run the three synchronized phases: all GetPM/GetPS, then all Evict.
-func runSynchronizedTrial(clients []*client_set, alpha float32) []MvpPosition {
-	var pspmwg sync.WaitGroup
+func syncClientPositionMaps(clients []*client_set) {
+	var wg sync.WaitGroup
 	for _, clientSet := range clients {
-		op := opgenerater(alpha, len(clientSet.client.PositionMap)-1)
-		pspmwg.Add(1)
-		go GetPmPs(clientSet, op, &pspmwg)
+		wg.Add(1)
+		go func(client *MvpClient) {
+			defer wg.Done()
+			version, pathMaps, err := client.GetPM()
+			if err != nil {
+				log.Printf("GetPM error: %v", err)
+				return
+			}
+			client.seq = version
+			client.consolidatePathMaps(pathMaps)
+		}(clientSet.client)
 	}
-	pspmwg.Wait()
+	wg.Wait()
+}
 
-	var evictwg sync.WaitGroup
+func runSharedAddressGetPSOnlyTrial(clients []*client_set, op OramOP) []MvpPosition {
+	var wg sync.WaitGroup
 	for _, clientSet := range clients {
-		evictwg.Add(1)
-		go syncevict(clientSet, &evictwg)
+		wg.Add(1)
+		go getPSOnly(clientSet, op, &wg)
 	}
-	evictwg.Wait()
+	wg.Wait()
 
 	leaves := make([]MvpPosition, 0, len(clients))
 	for _, clientSet := range clients {
@@ -158,58 +168,16 @@ func runSynchronizedTrial(clients []*client_set, alpha float32) []MvpPosition {
 	return leaves
 }
 
-// Execute GetPM and GetPS, then prepare the eviction data for one client.
-func GetPmPs(c *client_set, op OramOP, pspmwg *sync.WaitGroup) {
-	defer pspmwg.Done()
+func getPSOnly(c *client_set, op OramOP, wg *sync.WaitGroup) {
+	defer wg.Done()
 
 	client := c.client
-	c.ready = false
-	version, pathMaps, err := client.GetPM()
-	if err != nil {
-		log.Printf("GetPM error: %v", err)
-		return
-	}
-	client.seq = version
-
-	client.consolidatePathMaps(pathMaps)
-
 	accessPosition := client.PositionMap[op.target].Slot
 	leaf := client.selectPath(accessPosition, client.L)
 	c.selectedPosition = leaf
 
-	client.path, client.Stash, err = client.GetPS(leaf)
-	if err != nil {
+	if _, _, err := client.GetPS(leaf); err != nil {
 		log.Printf("GetPS error: %v", err)
-		return
-	}
-
-	W := client.mergePathStashes()
-	targetBlock, ok := W[op.target]
-	if !ok {
-		log.Panicf("Not target block in working set: client=%d addr=%d", client.ClientID, op.target)
-	}
-
-	if op.OP == Write {
-		targetBlock.Data = op.param
-		targetBlock.Version = Versions{version, version, version}
-	} else {
-		targetBlock.Version.SetA(version)
-		targetBlock.Version.SetS(version)
-	}
-	W[op.target] = targetBlock
-
-	c.populatePath, c.populateStash, c.populatedPathMap = client.populatePath(W, op)
-	c.ready = true
-}
-
-// Commit the eviction data prepared by GetPmPs.
-func syncevict(c *client_set, evictwg *sync.WaitGroup) {
-	defer evictwg.Done()
-	if !c.ready {
-		return
-	}
-	if err := c.client.Evict(c.populatePath, c.populatedPathMap, c.populateStash); err != nil {
-		log.Printf("Evict error: %v", err)
 	}
 }
 
@@ -264,7 +232,7 @@ func makeKDistribution(clientCount int) map[int]int {
 	return distribution
 }
 
-// Count how many distinct leaves appear in one synchronized trial.
+// Count how many distinct leaves appear in one trial.
 func countDistinctLeaves(leaves []MvpPosition) int {
 	seen := make(map[MvpBucketPosition]struct{}, len(leaves))
 	for _, leaf := range leaves {

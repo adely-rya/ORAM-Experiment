@@ -262,12 +262,34 @@ type path struct {
 	Seq  Version
 }
 
-func newPath(addr int, to MvpPosition, ver Versions, seq Version) path {
+func newPath(addr int, to any, ver Versions, seq Version) path {
 	return path{
 		addr: addr,
-		to:   to,
+		to:   pathPosition(to),
 		Ver:  ver,
 		Seq:  seq,
+	}
+}
+
+func pathPosition(to any) MvpPosition {
+	switch position := to.(type) {
+	case MvpPosition:
+		return position
+	case MvpBucketPosition:
+		return MvpPosition{bucket: position}
+	default:
+		panic("unsupported path destination type")
+	}
+}
+
+func pathBucketPosition(to any) MvpBucketPosition {
+	switch position := to.(type) {
+	case MvpBucketPosition:
+		return position
+	case MvpPosition:
+		return position.bucket
+	default:
+		panic("unsupported path destination type")
 	}
 }
 
@@ -784,40 +806,35 @@ func (c *MvpClient) consolidatePathMaps(pathMaps []path) {
 }
 
 func (c *MvpClient) selectPath(accessPosition MvpPosition, pathlen int) MvpPosition {
-	if accessPosition == mvpStashPosition || accessPosition.bucket == mvpRootBucketPosition {
-		accessPosition = c.randomPositionMapSlot()
+	if accessPosition == mvpStashPosition {
+		return randomLeafPosition(pathlen)
 	}
 
 	return selectPath(accessPosition, pathlen)
 }
 
-func (c *MvpClient) randomPositionMapSlot() MvpPosition {
-	if len(c.PositionMap) == 0 {
-		return MvpPosition{}
-	}
-
-	fakeTargetAddr := rand.Intn(len(c.PositionMap))
-	if entry, ok := c.PositionMap[fakeTargetAddr]; ok {
-		return entry.Slot
-	}
-
-	index := rand.Intn(len(c.PositionMap))
-	for _, entry := range c.PositionMap {
-		if index == 0 {
-			return entry.Slot
+func randomLeafPosition(pathlen int) MvpPosition {
+	leaf := ""
+	for len(leaf) < pathlen {
+		if rand.Intn(2) == 0 {
+			leaf += "0"
+		} else {
+			leaf += "1"
 		}
-		index--
 	}
 
-	return MvpPosition{}
+	return MvpPosition{
+		bucket: MvpBucketPosition(leaf),
+	}
 }
 
-func selectPath(accessPosition MvpPosition, pathlen int) MvpPosition {
-	if accessPosition == mvpStashPosition || accessPosition.bucket == mvpRootBucketPosition {
-		accessPosition = MvpPosition{}
+func selectPath(accessPosition any, pathlen int) MvpPosition {
+	bucketPosition := pathBucketPosition(accessPosition)
+	if bucketPosition == mvpStashBucketPosition || bucketPosition == mvpRootBucketPosition {
+		bucketPosition = ""
 	}
 
-	leaf := accessPosition.String()
+	leaf := bucketPosition.String()
 	for len(leaf) < pathlen {
 		if rand.Intn(2) == 0 {
 			leaf += "0"
@@ -915,129 +932,193 @@ func sort_position(positionList []MvpPosition) []MvpPosition {
 }
 
 func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosition]MvpSlot, []MvpDataBlock, []path) {
+	// 返却するpathはslot単位でサーバーへ渡すので、実際の書き込み位置はMvpPositionで持つ。
 	populatedPath := make(map[MvpPosition]MvpSlot, c.L+1)
+	// 返却するstashは、pathへ残らなかったブロックだけを入れる。
 	populatedStash := make([]MvpDataBlock, 0, 20)
+	// PositionMap更新はslot単位で、artifactのlocationと同じ意味のMvpPositionを記録する。
 	populatedPathMap := make([]path, 0, len(W))
+	// アクセス対象の現在位置はslot単位で読む。
 	targetPosition := c.PositionMap[op.target].Slot
+	// 読み込んだpathに含まれる全slotを、stashからpathへ戻す置換候補として記録する。
+	allSlot := make([]MvpPosition, 0, (c.L+1)*c.Z)
+	// 初回配置で実際にブロックを置いたslotだけを、後段のshuffle対象として記録する。
+	usedSlot := make([]MvpPosition, 0, c.L*c.Z)
+	// アクセス対象ブロックが初回配置されたslotを、後で必ずstashへ退避するために覚える。
+	var targetPlacedPosition MvpPosition
+	// アクセス対象ブロックが初回配置されたかどうかを記録する。
+	targetPlaced := false
 
-	used_slot := make([]MvpPosition, 0, c.L*4)
-	for position := range c.path {
+	// 読み込んだpath上の各bucketを走査する。
+	for bucketPosition := range c.path {
+		// bucket内の各slotを順番に埋める。
 		for i := 0; i < c.Z; i++ {
-			mp := MvpPosition{position, MvpSlotPosition(i)}
-
-			candinates := make([]MvpDataBlock, 0, len(W))
+			// このslotに書くための実位置を作る。
+			position := MvpPosition{bucket: bucketPosition, slot: MvpSlotPosition(i)}
+			// このslotはpath上に存在するので、後段の置換候補へ追加する。
+			allSlot = append(allSlot, position)
+			// このbucketに所属するブロック候補をWから集める。
+			candidates := make([]MvpDataBlock, 0, len(W))
+			// W内の各ブロックを確認する。
 			for _, block := range W {
-				if c.PositionMap[block.Addr].Slot == mp {
-					candinates = append(candinates, block)
+				// PositionMapがこのexact slotを指すブロックだけを候補にする。
+				if c.PositionMap[block.Addr].Slot == position {
+					candidates = append(candidates, block)
 				}
 			}
-
-			if len(candinates) == 0 {
-				populatedPath[mp] = NewMvpSlot(c.seq)
+			// 候補がなければ、このslotは空slotとして出力する。
+			if len(candidates) == 0 {
+				populatedPath[position] = NewMvpSlot(c.seq)
 				continue
 			}
-
-			candinates = sort_block(candinates)
-
-			selected := candinates[len(candinates)-1]
-
+			// 同じbucketに複数候補がある場合はversion順に並べる。
+			candidates = sort_block(candidates)
+			// 一番新しいversionのブロックをこのslotに置く。
+			selected := candidates[len(candidates)-1]
+			// 書き込み用の新しいslotを作る。
 			slot := NewMvpSlot(c.seq)
+			// 選んだブロックをslotへ入れる。
 			slot.SetBlock(selected)
-
-			populatedPath[mp] = slot
-			used_slot = append(used_slot, mp)
-
+			// 実際にこのslotをpath出力へ登録する。
+			populatedPath[position] = slot
+			// このslotは後段のshuffleで使えるslotとして覚える。
+			usedSlot = append(usedSlot, position)
+			// アクセス対象ブロックを置いたslotなら、その実slotを覚える。
+			if selected.Addr == op.target {
+				targetPlacedPosition = position
+				targetPlaced = true
+			}
+			// 選んだブロックはWから取り除き、同じブロックを複数slotへ置かないようにする。
 			delete(W, selected.Addr)
 		}
 	}
 
+	// stashからpathへ戻す候補を作る。
 	blockList := make([]MvpDataBlock, 0, len(W))
+	// Wに残ったブロックを走査する。
 	for _, block := range W {
+		// アクセス対象ブロックはstashへ退避するので、pathへ戻す候補から外す。
 		if block.Addr == op.target {
 			continue
 		}
+		// アクセス対象以外の残りブロックをswap候補へ入れる。
 		blockList = append(blockList, block)
 	}
 
-	swap_cadinate := make([]MvpDataBlock, 0, c.Z)
+	// 実際にpathへ戻すブロックを最大Z個まで選ぶ。
+	swapCandidate := make([]MvpDataBlock, 0, c.Z)
+	// 候補がZ個以下なら全て選ぶ。
 	if len(blockList) <= c.Z {
-		swap_cadinate = append(swap_cadinate, blockList...)
+		swapCandidate = append(swapCandidate, blockList...)
 	} else {
+		// 候補がZ個より多ければランダムにZ個だけ選ぶ。
 		for _, index := range rand.Perm(len(blockList))[:c.Z] {
-			swap_cadinate = append(swap_cadinate, blockList[index])
+			swapCandidate = append(swapCandidate, blockList[index])
 		}
 	}
 
-	swap_slot := make([]MvpPosition, 0, c.Z)
+	// swapするslotを最大Z個まで選ぶ。
+	swapSlot := make([]MvpPosition, 0, c.Z)
+	// 同じslotを二重に選ばないための集合を作る。
 	swapSlotSet := make(map[MvpPosition]bool, c.Z)
-	if targetPosition != mvpStashPosition {
-		if _, ok := populatedPath[targetPosition]; ok {
-			swap_slot = append(swap_slot, targetPosition)
-			swapSlotSet[targetPosition] = true
-		}
+	// アクセス対象が初回配置された場合は、そのslotを必ずswap対象にする。
+	if targetPlaced && targetPosition != mvpStashPosition {
+		swapSlot = append(swapSlot, targetPlacedPosition)
+		swapSlotSet[targetPlacedPosition] = true
 	}
-	for _, index := range rand.Perm(len(used_slot)) {
-		if len(swap_slot) >= c.Z {
+	// path全体のslotの中から、残りのswap slotをランダムに選ぶ。
+	for _, index := range rand.Perm(len(allSlot)) {
+		// Z個選べたら終了する。
+		if len(swapSlot) >= c.Z {
 			break
 		}
-
-		position := used_slot[index]
+		// ランダム順で次のslot候補を取り出す。
+		position := allSlot[index]
+		// 既に選んだslotなら飛ばす。
 		if swapSlotSet[position] {
 			continue
 		}
-		swap_slot = append(swap_slot, position)
+		// このslotをswap対象へ追加する。
+		swapSlot = append(swapSlot, position)
+		// このslotを選択済みにする。
 		swapSlotSet[position] = true
 	}
 
-	for index, slot_position := range swap_slot {
-		slot := populatedPath[slot_position]
-
+	// 選んだslotをstash候補と入れ替える。
+	for index, slotPosition := range swapSlot {
+		// swap前にそのslotへ置かれていたブロックを読む。
+		slot := populatedPath[slotPosition]
+		// swap後に置く新しいslotを作る。
 		newslot := NewMvpSlot(c.seq)
-		if len(swap_cadinate) > index {
-			newslot.SetBlock(swap_cadinate[index])
-			delete(W, swap_cadinate[index].Addr)
+		// swap候補ブロックが残っていれば、このslotへ入れる。
+		if len(swapCandidate) > index {
+			newslot.SetBlock(swapCandidate[index])
+			delete(W, swapCandidate[index].Addr)
 		}
-
+		// swap前のslotにブロックがあれば、stashへ戻すためにWへ戻す。
 		if !slot.IsEmpty() {
 			swaped := slot.Value
 			W[swaped.Addr] = swaped
 		}
-
-		populatedPath[slot_position] = newslot
+		// swap後のslotをpath出力へ反映する。
+		populatedPath[slotPosition] = newslot
 	}
 
+	// path上に残ったブロックを集め直す。
 	onPathBlock := make([]MvpDataBlock, 0)
-	onPathPosition := make([]MvpPosition, 0, len(used_slot))
-
-	for _, position := range used_slot {
+	// path上に残ったブロックの実slotを集め直す。
+	onPathPosition := make([]MvpPosition, 0, len(allSlot))
+	// path全体を再配置対象として見る。
+	for _, position := range allSlot {
+		// 現在そのslotにあるブロックを読む。
 		slot := populatedPath[position]
+		// 空slotは再配置対象にしない。
 		if slot.IsEmpty() {
 			continue
 		}
+		// slot内のブロックを再配置用リストへ入れる。
 		onPathBlock = append(onPathBlock, slot.Value)
+		// 実際に使われているslotを再配置用リストへ入れる。
 		onPathPosition = append(onPathPosition, position)
 	}
 
-	onPathBlock = sort_block(onPathBlock)
+	// アクセス時刻Aが大きいブロックから順に並べ、よくアクセスされるブロックをroot側へ置く。
+	sort.Slice(onPathBlock, func(i, j int) bool {
+		return onPathBlock[i].Version.A > onPathBlock[j].Version.A
+	})
+	// slotはbucket深さでroot側からleaf側へ並べる。
 	onPathPosition = sort_position(onPathPosition)
 
+	// 並べ替え後のブロックをslotへ書き戻す。
 	for index, position := range onPathPosition {
+		// 新しいslot versionでslotを作る。
 		slot := NewMvpSlot(c.seq)
+		// root側から順に置くブロックを取り出す。
 		block := onPathBlock[index]
+		// このevictで移動したことをblock versionへ記録する。
 		block.Version.SetS(c.seq)
+		// ブロックをslotへ入れる。
 		slot.SetBlock(block)
+		// path出力へslotを書き戻す。
 		populatedPath[position] = slot
-
+		// PositionMap更新はslot単位で記録する。
 		path := newPath(block.Addr, position, block.Version, c.seq)
+		// PathMapへslot位置の更新を追加する。
 		populatedPathMap = append(populatedPathMap, path)
 	}
 
+	// pathへ残らなかったブロックをstashへ入れる。
 	for _, block := range W {
+		// このevictでstashへ移動したことをblock versionへ記録する。
 		block.Version.SetS(c.seq)
+		// 新しいstash出力へブロックを追加する。
 		populatedStash = append(populatedStash, block)
+		// PositionMap更新はstash位置として記録する。
 		path := newPath(block.Addr, mvpStashPosition, block.Version, c.seq)
+		// PathMapへstash位置の更新を追加する。
 		populatedPathMap = append(populatedPathMap, path)
 	}
 
+	// 新しいpath、新しいstash、新しいPathMapを返す。
 	return populatedPath, populatedStash, populatedPathMap
 }
