@@ -1,3 +1,0 @@
-accesses,n,l,z,initial_seed,run1_seed,run2_seed,run1_total_bucket_reads,run2_total_bucket_reads,statistical_distance,elapsed_ms
-10,256,8,4,542,563,564,90,90,0.5111111111,18
-100,256,8,4,542,743,744,900,900,0.3044444444,160

@@ -1,3 +1,0 @@
-accesses,window_start,window_end,n,l,z,seed,window_min_ns,window_mean_ns,window_p50_ns,window_p90_ns,window_p95_ns,window_p99_ns,window_max_ns,cumulative_mean_ns,cumulative_p95_ns,total_bucket_reads,elapsed_ms
-10,1,10,64,6,4,542,104972,390186.50,113183,634306,1858481,1858481,1858481,390186.50,1858481,70,3
-100,11,100,64,6,4,542,97307,163647.56,112273,334127,369027,481941,481941,186301.45,422351,700,19

@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"math/rand"
+	"testing"
+)
 
 func TestGetPSCountsBucketReads(t *testing.T) {
 	const (
@@ -59,6 +62,251 @@ func TestGetPSDoesNotCountMissingSnapshot(t *testing.T) {
 
 	if server.tree.TotalBucketRead != 0 {
 		t.Fatalf("TotalBucketRead = %d, want 0", server.tree.TotalBucketRead)
+	}
+}
+
+func TestSynchronizedServerGetPSDoesNotRequireSnapshot(t *testing.T) {
+	const (
+		z = 2
+		l = 3
+	)
+
+	server := NewSynchronizedMvpServer(z, l)
+	server.InitializeRandomData(4, 1)
+
+	reply := make(chan GetpsResponse, 1)
+	GetpsRequest{
+		ClientID: 99,
+		Leaf:     MvpPosition{bucket: MvpBucketPosition("010")},
+		Reply:    reply,
+	}.handle(server)
+	res := <-reply
+	if res.Err != nil {
+		t.Fatalf("GetPS returned error: %v", res.Err)
+	}
+
+	if got := len(res.Path); got != l+1 {
+		t.Fatalf("path length = %d, want %d", got, l+1)
+	}
+	if got := server.tree.TotalBucketRead; got != int64(l+1) {
+		t.Fatalf("TotalBucketRead = %d, want %d", got, l+1)
+	}
+}
+
+func TestSynchronizedServerEvictDoesNotRequireSnapshot(t *testing.T) {
+	server := NewSynchronizedMvpServer(1, 1)
+	server.InitializeRandomData(1, 1)
+
+	block := MvpDataBlock{
+		Addr: 0,
+		Data: "updated",
+		Version: Versions{
+			V: 1,
+			A: 1,
+			S: 1,
+		},
+	}
+	slot := NewMvpSlot(1)
+	if ok := slot.SetBlock(block); !ok {
+		t.Fatal("failed to set block")
+	}
+
+	reply := make(chan EvictResponse, 1)
+	EvictReques{
+		ClientID: 99,
+		Seq:      1,
+		Path: map[MvpPosition]MvpSlot{
+			{bucket: mvpRootBucketPosition, slot: 0}: slot,
+		},
+		PathMap: []path{
+			newPath(0, MvpPosition{bucket: mvpRootBucketPosition, slot: 0}, block.Version, 1),
+		},
+		Stash: []MvpDataBlock{},
+		Reply: reply,
+	}.handle(server)
+	if res := <-reply; res.Err != nil {
+		t.Fatalf("Evict returned error: %v", res.Err)
+	}
+
+	got := server.tree.Tree[mvpRootBucketPosition].Slots[0][1]
+	if got.IsEmpty() || got.Value.Data != "updated" {
+		t.Fatalf("root slot was not updated: %+v", got)
+	}
+}
+
+func TestSynchronizedServerEvictDoesNotDeleteUnrelatedLivePathVersions(t *testing.T) {
+	server := NewSynchronizedMvpServer(1, 1)
+	server.InitializeRandomData(0, 1)
+
+	keptBlock := MvpDataBlock{
+		Addr: 1,
+		Data: "keep",
+		Version: Versions{
+			V: 1,
+			A: 1,
+			S: 1,
+		},
+	}
+	keptSlot := NewMvpSlot(1)
+	if ok := keptSlot.SetBlock(keptBlock); !ok {
+		t.Fatal("failed to set kept block")
+	}
+	server.tree.Tree[mvpRootBucketPosition].Slots[0][1] = keptSlot
+
+	newSlot := NewMvpSlot(2)
+	reply := make(chan EvictResponse, 1)
+	EvictReques{
+		ClientID: 0,
+		Seq:      2,
+		Path: map[MvpPosition]MvpSlot{
+			{bucket: mvpRootBucketPosition, slot: 0}: newSlot,
+		},
+		PathMap: []path{},
+		Stash:   []MvpDataBlock{},
+		Reply:   reply,
+	}.handle(server)
+	if res := <-reply; res.Err != nil {
+		t.Fatalf("Evict returned error: %v", res.Err)
+	}
+
+	got := server.tree.Tree[mvpRootBucketPosition].Slots[0][1]
+	if got.IsEmpty() || got.Value.Addr != keptBlock.Addr {
+		t.Fatalf("unrelated live path version was deleted: %+v", got)
+	}
+}
+
+func TestSynchronizedServerEvictDoesNotDeleteNewerLiveVersionOfSameAddr(t *testing.T) {
+	server := NewSynchronizedMvpServer(1, 1)
+	server.InitializeRandomData(0, 1)
+
+	newerBlock := MvpDataBlock{
+		Addr: 1,
+		Data: "newer",
+		Version: Versions{
+			V: 3,
+			A: 3,
+			S: 3,
+		},
+	}
+	newerSlot := NewMvpSlot(3)
+	if ok := newerSlot.SetBlock(newerBlock); !ok {
+		t.Fatal("failed to set newer block")
+	}
+	server.tree.Tree[mvpRootBucketPosition].Slots[0][3] = newerSlot
+
+	olderBlock := MvpDataBlock{
+		Addr: 1,
+		Data: "older",
+		Version: Versions{
+			V: 2,
+			A: 2,
+			S: 2,
+		},
+	}
+	olderSlot := NewMvpSlot(2)
+	if ok := olderSlot.SetBlock(olderBlock); !ok {
+		t.Fatal("failed to set older block")
+	}
+
+	reply := make(chan EvictResponse, 1)
+	EvictReques{
+		ClientID: 0,
+		Seq:      2,
+		Path: map[MvpPosition]MvpSlot{
+			{bucket: mvpRootBucketPosition, slot: 0}: olderSlot,
+		},
+		PathMap: []path{
+			newPath(1, MvpPosition{bucket: mvpRootBucketPosition, slot: 0}, olderBlock.Version, 2),
+		},
+		Stash: []MvpDataBlock{},
+		Reply: reply,
+	}.handle(server)
+	if res := <-reply; res.Err != nil {
+		t.Fatalf("Evict returned error: %v", res.Err)
+	}
+
+	got := server.tree.Tree[mvpRootBucketPosition].Slots[0][3]
+	if got.IsEmpty() || got.Value.Data != "newer" {
+		t.Fatalf("newer live version of same addr was deleted: %+v", got)
+	}
+}
+
+func TestSynchronizedServerEvictDoesNotDeleteUnrelatedLiveStashBlocks(t *testing.T) {
+	server := NewSynchronizedMvpServer(1, 1)
+	server.InitializeRandomData(0, 1)
+
+	keptBlock := MvpDataBlock{
+		Addr: 1,
+		Data: "keep",
+		Version: Versions{
+			V: 1,
+			A: 1,
+			S: 1,
+		},
+	}
+	server.Stashs[1] = []MvpDataBlock{keptBlock}
+
+	reply := make(chan EvictResponse, 1)
+	EvictReques{
+		ClientID: 0,
+		Seq:      2,
+		Path:     map[MvpPosition]MvpSlot{},
+		PathMap:  []path{},
+		Stash:    []MvpDataBlock{},
+		Reply:    reply,
+	}.handle(server)
+	if res := <-reply; res.Err != nil {
+		t.Fatalf("Evict returned error: %v", res.Err)
+	}
+
+	if got := server.Stashs[1]; len(got) != 1 || got[0].Addr != keptBlock.Addr {
+		t.Fatalf("unrelated live stash block was deleted: %+v", got)
+	}
+}
+
+func TestSynchronizedServerEvictDoesNotDeleteNewerLiveStashVersionOfSameAddr(t *testing.T) {
+	server := NewSynchronizedMvpServer(1, 1)
+	server.InitializeRandomData(0, 1)
+
+	newerBlock := MvpDataBlock{
+		Addr: 1,
+		Data: "newer",
+		Version: Versions{
+			V: 3,
+			A: 3,
+			S: 3,
+		},
+	}
+	server.Stashs[3] = []MvpDataBlock{newerBlock}
+
+	olderBlock := MvpDataBlock{
+		Addr: 1,
+		Data: "older",
+		Version: Versions{
+			V: 2,
+			A: 2,
+			S: 2,
+		},
+	}
+
+	reply := make(chan EvictResponse, 1)
+	EvictReques{
+		ClientID: 0,
+		Seq:      2,
+		Path:     map[MvpPosition]MvpSlot{},
+		PathMap: []path{
+			newPath(1, mvpStashPosition, olderBlock.Version, 2),
+		},
+		Stash: []MvpDataBlock{olderBlock},
+		Reply: reply,
+	}.handle(server)
+	if res := <-reply; res.Err != nil {
+		t.Fatalf("Evict returned error: %v", res.Err)
+	}
+
+	got := server.Stashs[3]
+	if len(got) != 1 || got[0].Data != "newer" {
+		t.Fatalf("newer live stash version of same addr was deleted: %+v", got)
 	}
 }
 
@@ -220,6 +468,18 @@ func TestSelectPathTreatsAnyRootSlotAsRoot(t *testing.T) {
 	for _, char := range leaf.bucket.String() {
 		if char != '0' && char != '1' {
 			t.Fatalf("leaf = %q, want only binary digits", leaf.bucket.String())
+		}
+	}
+}
+
+func TestFiniteZipfAddrSupportsAlphaZeroAndFractionalAlpha(t *testing.T) {
+	for _, alpha := range []float64{0, 0.5, 0.9, 1.0} {
+		rng := rand.New(rand.NewSource(1))
+		for i := 0; i < 100; i++ {
+			addr := finiteZipfAddr(rng, alpha, 7)
+			if addr < 0 || addr > 7 {
+				t.Fatalf("finiteZipfAddr(alpha=%f) = %d, want within 0..7", alpha, addr)
+			}
 		}
 	}
 }

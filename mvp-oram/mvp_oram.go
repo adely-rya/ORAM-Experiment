@@ -340,6 +340,7 @@ type MvpServer struct {
 	Stashs                       map[int][]MvpDataBlock
 	tree                         MvpTree
 	counter                      Version
+	useSnapshot                  bool
 	Snapshot                     map[int]OramState
 	PathMapCursor                map[int]int
 	PathMapCompactInterval       int
@@ -357,12 +358,20 @@ func NewMvpServer(z int, l int) *MvpServer {
 		tree:          NewMvpTree(z, l),
 		Requests:      make(chan ServerRequest),
 		counter:       mvpInitialVersion,
+		useSnapshot:   true,
 		Snapshot:      make(map[int]OramState, 50),
 		PathMapCursor: make(map[int]int, 50),
 
 		PathMapCompactInterval:      mvpDefaultPathMapCompactInterval,
 		PathMapCompactProtectedTail: mvpDefaultPathMapCompactProtectedTail,
 	}
+}
+
+func NewSynchronizedMvpServer(z int, l int) *MvpServer {
+	server := NewMvpServer(z, l)
+	server.useSnapshot = false
+	server.Snapshot = nil
+	return server
 }
 
 func (s *MvpServer) SetPathMapCompaction(interval int, protectedTail int) {
@@ -482,9 +491,11 @@ func (r GetpmRequest) handle(s *MvpServer) {
 	s.counter.increment()
 	seq := s.counter
 
-	s.Snapshot[r.ClientID] = OramState{
-		TreeState:  s.tree.Clone(),
-		StashState: cloneStashs(s.Stashs),
+	if s.useSnapshot {
+		s.Snapshot[r.ClientID] = OramState{
+			TreeState:  s.tree.Clone(),
+			StashState: cloneStashs(s.Stashs),
+		}
 	}
 
 	cursor := s.PathMapCursor[r.ClientID]
@@ -503,46 +514,81 @@ func (r GetpmRequest) handle(s *MvpServer) {
 }
 
 func (r GetpsRequest) handle(s *MvpServer) {
-	oramstate, ok := s.Snapshot[r.ClientID]
+	var tree MvpTree
+	var stash map[int][]MvpDataBlock
+	if s.useSnapshot {
+		oramstate, ok := s.Snapshot[r.ClientID]
+		if !ok {
+			r.Reply <- GetpsResponse{
+				Err: fmt.Errorf("snapshot for client %d not found", r.ClientID),
+			}
+			return
+		}
+		tree = oramstate.TreeState
+		stash = oramstate.StashState
+	} else {
+		tree = s.tree
+		stash = cloneStashs(s.Stashs)
+	}
+
+	path := make(map[MvpBucketPosition]MvpBucket, s.tree.L+1)
+	root, ok := tree.Tree[mvpRootBucketPosition]
 	if !ok {
 		r.Reply <- GetpsResponse{
-			Err: fmt.Errorf("snapshot for client %d not found", r.ClientID),
+			Err: fmt.Errorf("root bucket not found"),
 		}
 		return
 	}
 
-	path := make(map[MvpBucketPosition]MvpBucket, s.tree.L+1)
-	path[mvpRootBucketPosition] = oramstate.TreeState.Tree[mvpRootBucketPosition]
+	path[mvpRootBucketPosition] = root
 	s.tree.CountBucketRead(mvpRootBucketPosition)
 
 	leaf := r.Leaf.bucket.String()
 	for len(leaf) != 0 {
 		bucketPosition := MvpBucketPosition(leaf)
-		path[bucketPosition] = oramstate.TreeState.Tree[bucketPosition]
+		path[bucketPosition] = tree.Tree[bucketPosition]
 		s.tree.CountBucketRead(bucketPosition)
 		leaf = leaf[:len(leaf)-1]
 	}
 
 	r.Reply <- GetpsResponse{
 		Path:  path,
-		Stash: oramstate.StashState,
+		Stash: stash,
 		Err:   nil,
 	}
 }
 
 func (r EvictReques) handle(s *MvpServer) {
-	oldstate := s.Snapshot[r.ClientID]
-	oldtree := oldstate.TreeState.Tree
-	oldstash := oldstate.StashState
-
-	delete(s.Snapshot, r.ClientID)
-
 	nowtree := s.tree.Tree
+	var oldtree map[MvpBucketPosition]MvpBucket
+	var oldstash map[int][]MvpDataBlock
+	outputVersions := make(map[int]Versions, len(r.PathMap))
+	for _, path := range r.PathMap {
+		if current, ok := outputVersions[path.addr]; !ok || newerVersions(path.Ver, current) {
+			outputVersions[path.addr] = path.Ver
+		}
+	}
+
+	if s.useSnapshot {
+		oldstate := s.Snapshot[r.ClientID]
+		oldtree = oldstate.TreeState.Tree
+		oldstash = oldstate.StashState
+		delete(s.Snapshot, r.ClientID)
+	} else {
+		oldtree = nowtree
+		oldstash = s.Stashs
+	}
 
 	for position, newslot := range r.Path {
 		slots := nowtree[position.bucket].Slots[position.slot]
 		oldslots := oldtree[position.bucket].Slots[position.slot]
-		for version := range oldslots {
+		for version, oldslot := range oldslots {
+			if !s.useSnapshot && !oldslot.IsEmpty() {
+				outputVersion, ok := outputVersions[oldslot.Value.Addr]
+				if !ok || newerVersions(oldslot.Value.Version, outputVersion) {
+					continue
+				}
+			}
 
 			_, ok := slots[version]
 			if ok {
@@ -553,10 +599,28 @@ func (r EvictReques) handle(s *MvpServer) {
 		slots[newslot.Version] = newslot
 	}
 
-	for version := range oldstash {
-		_, ok := s.Stashs[version]
-		if ok {
-			delete(s.Stashs, version)
+	if s.useSnapshot {
+		for version := range oldstash {
+			_, ok := s.Stashs[version]
+			if ok {
+				delete(s.Stashs, version)
+			}
+		}
+	} else {
+		for version, stash := range oldstash {
+			remaining := make([]MvpDataBlock, 0, len(stash))
+			for _, block := range stash {
+				outputVersion, ok := outputVersions[block.Addr]
+				if ok && !newerVersions(block.Version, outputVersion) {
+					continue
+				}
+				remaining = append(remaining, block)
+			}
+			if len(remaining) == 0 {
+				delete(s.Stashs, version)
+			} else {
+				s.Stashs[version] = remaining
+			}
 		}
 	}
 	s.Stashs[int(r.Seq)] = r.Stash
