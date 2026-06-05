@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"sort"
 	"strconv"
-	"time"
 )
 
 type MvpBucketPosition string
@@ -727,8 +726,6 @@ func (c *MvpClient) Evict(path map[MvpPosition]MvpSlot, pathmap []path, stash []
 }
 
 func (c *MvpClient) Run(addrCount int) error {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
 
 	for {
 		target := rand.Intn(addrCount)
@@ -738,8 +735,6 @@ func (c *MvpClient) Run(addrCount int) error {
 		if err != nil {
 			return err
 		}
-
-		<-ticker.C
 	}
 }
 
@@ -773,7 +768,6 @@ func (c *MvpClient) Access(op OramOP) error {
 		targetBlock.Version = Versions{version, version, version}
 	} else {
 		targetBlock.Version.SetA(version)
-		targetBlock.Version.SetS(version)
 	}
 	W[op.target] = targetBlock
 
@@ -792,14 +786,14 @@ func (c *MvpClient) consolidatePathMaps(pathMaps []path) {
 	latestPathMap := make(map[int]path, len(pathMaps))
 	for _, v := range pathMaps {
 		latest, ok := latestPathMap[v.addr]
-		if !ok || newerVersions(v.Ver, latest.Ver) {
+		if !ok || newerPathUpdate(v, latest) {
 			latestPathMap[v.addr] = v
 		}
 	}
 
 	for _, v := range latestPathMap {
 		current, ok := c.PositionMap[v.addr]
-		if !ok || newerVersions(v.Ver, current.Ts) {
+		if !ok || newerPositionUpdate(v, current) {
 			c.PositionMap[v.addr] = MvpPositionMapEntry{Slot: v.to, Ts: v.Ver}
 		}
 	}
@@ -854,7 +848,7 @@ func (c *MvpClient) mergePathStashes() map[int]MvpDataBlock {
 	for _, v := range c.Stash {
 		for _, block := range v {
 			pm, ok := c.PositionMap[block.Addr]
-			if ok && pm.Slot == mvpStashPosition && pm.Ts == block.Version {
+			if ok && pm.Slot == mvpStashPosition && sameDataVersion(pm.Ts, block.Version) {
 				W[block.Addr] = block
 			}
 		}
@@ -870,7 +864,7 @@ func (c *MvpClient) mergePathStashes() map[int]MvpDataBlock {
 				block := slot.Value
 				pm, ok := c.PositionMap[block.Addr]
 				blockPosition := MvpPosition{bucket: bucketPosition, slot: slotPosition}
-				if ok && pm.Slot == blockPosition && pm.Ts == block.Version {
+				if ok && pm.Slot == blockPosition && sameDataVersion(pm.Ts, block.Version) {
 					W[block.Addr] = block
 				}
 			}
@@ -890,6 +884,38 @@ func newerVersions(left Versions, right Versions) bool {
 	return left.S > right.S
 }
 
+func sameDataVersion(left Versions, right Versions) bool {
+	return left.V == right.V && left.A == right.A
+}
+
+func newerPathUpdate(left path, right path) bool {
+	if left.Ver.V != right.Ver.V {
+		return left.Ver.V > right.Ver.V
+	}
+	if left.Ver.A != right.Ver.A {
+		return left.Ver.A > right.Ver.A
+	}
+	return left.Seq > right.Seq
+}
+
+func newerPositionUpdate(update path, current MvpPositionMapEntry) bool {
+	if update.Ver.V != current.Ts.V {
+		return update.Ver.V > current.Ts.V
+	}
+	if update.Ver.A != current.Ts.A {
+		return update.Ver.A > current.Ts.A
+	}
+	return update.Seq > current.Ts.S
+}
+
+func positionMapVersion(blockVersion Versions, locationUpdate Version) Versions {
+	return Versions{
+		V: blockVersion.V,
+		A: blockVersion.A,
+		S: locationUpdate,
+	}
+}
+
 func sort_block(blockList []MvpDataBlock) []MvpDataBlock {
 	sort.Slice(blockList, func(i, j int) bool {
 		left := blockList[i].Version
@@ -901,7 +927,7 @@ func sort_block(blockList []MvpDataBlock) []MvpDataBlock {
 		if left.A != right.A {
 			return left.A < right.A
 		}
-		return left.S < right.S
+		return false
 	})
 
 	return blockList
@@ -1095,26 +1121,25 @@ func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosi
 		slot := NewMvpSlot(c.seq)
 		// root側から順に置くブロックを取り出す。
 		block := onPathBlock[index]
-		// このevictで移動したことをblock versionへ記録する。
-		block.Version.SetS(c.seq)
 		// ブロックをslotへ入れる。
 		slot.SetBlock(block)
 		// path出力へslotを書き戻す。
 		populatedPath[position] = slot
 		// PositionMap更新はslot単位で記録する。
-		path := newPath(block.Addr, position, block.Version, c.seq)
+		path := newPath(block.Addr, position, positionMapVersion(block.Version, c.seq), c.seq)
 		// PathMapへslot位置の更新を追加する。
 		populatedPathMap = append(populatedPathMap, path)
 	}
 
 	// pathへ残らなかったブロックをstashへ入れる。
 	for _, block := range W {
-		// このevictでstashへ移動したことをblock versionへ記録する。
-		block.Version.SetS(c.seq)
 		// 新しいstash出力へブロックを追加する。
 		populatedStash = append(populatedStash, block)
+		if c.PositionMap[block.Addr].Slot == mvpStashPosition && sameDataVersion(c.PositionMap[block.Addr].Ts, block.Version) {
+			continue
+		}
 		// PositionMap更新はstash位置として記録する。
-		path := newPath(block.Addr, mvpStashPosition, block.Version, c.seq)
+		path := newPath(block.Addr, mvpStashPosition, positionMapVersion(block.Version, c.seq), c.seq)
 		// PathMapへstash位置の更新を追加する。
 		populatedPathMap = append(populatedPathMap, path)
 	}

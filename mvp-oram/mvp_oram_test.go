@@ -484,6 +484,82 @@ func TestFiniteZipfAddrSupportsAlphaZeroAndFractionalAlpha(t *testing.T) {
 	}
 }
 
+func TestConsolidatePathMapsUsesSequenceForEqualDataVersion(t *testing.T) {
+	const addr = 1
+
+	client := &MvpClient{
+		PositionMap: map[int]MvpPositionMapEntry{
+			addr: {
+				Slot: mvpStashPosition,
+				Ts:   Versions{V: 1, A: 1, S: 1},
+			},
+		},
+	}
+
+	newPosition := MvpPosition{bucket: MvpBucketPosition("0"), slot: 0}
+	client.consolidatePathMaps([]path{
+		newPath(addr, newPosition, Versions{V: 1, A: 1, S: 2}, 2),
+	})
+
+	got := client.PositionMap[addr]
+	if got.Slot != newPosition {
+		t.Fatalf("position was not updated by newer location sequence: got %+v want %+v", got.Slot, newPosition)
+	}
+	if got.Ts.S != 2 {
+		t.Fatalf("location update sequence = %d, want 2", got.Ts.S)
+	}
+}
+
+func TestPopulatePathDoesNotReannounceUnchangedStashBlock(t *testing.T) {
+	const (
+		stashAddr = 7
+		target    = 99
+	)
+
+	stashVersion := Versions{V: 1, A: 1, S: 5}
+	stashBlock := MvpDataBlock{
+		Addr:    stashAddr,
+		Data:    "stash",
+		Version: Versions{V: 1, A: 1, S: 0},
+	}
+
+	client := &MvpClient{
+		L:   0,
+		Z:   0,
+		seq: 6,
+		PositionMap: map[int]MvpPositionMapEntry{
+			stashAddr: {
+				Slot: mvpStashPosition,
+				Ts:   stashVersion,
+			},
+			target: {
+				Slot: mvpRootPosition,
+				Ts:   Versions{V: 1, A: 1, S: 1},
+			},
+		},
+		path: map[MvpBucketPosition]MvpBucket{
+			mvpRootBucketPosition: {
+				Z:     0,
+				Slots: map[MvpSlotPosition]map[Version]MvpSlot{},
+			},
+		},
+	}
+
+	_, populatedStash, populatedPathMap := client.populatePath(
+		map[int]MvpDataBlock{stashAddr: stashBlock},
+		OramOP{OP: Write, target: target, param: "updated"},
+	)
+
+	if got := len(populatedStash); got != 1 {
+		t.Fatalf("populated stash length = %d, want 1", got)
+	}
+	for _, entry := range populatedPathMap {
+		if entry.addr == stashAddr {
+			t.Fatalf("unchanged stash block was reannounced in path map: %+v", entry)
+		}
+	}
+}
+
 func TestPopulatePathAlwaysSwapsAccessedPathSlot(t *testing.T) {
 	const targetAddr = 7
 

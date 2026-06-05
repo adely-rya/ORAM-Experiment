@@ -18,12 +18,12 @@ const (
 	n          = 1 << 12
 	seed       = 542
 	WarmUp     = 200
-	MonteCarlo = 2000000
+	MonteCarlo = 20000
 	minClient  = 1
 	maxClient  = 20
 )
 
-var experimentAlphas = []float32{0.1, 1.8}
+var experimentAlphas = []float32{0.9, 1.5}
 var zipfGeneratorRand = rand.New(rand.NewSource(time.Now().UnixNano()))
 var zipfGeneratorMu sync.Mutex
 
@@ -92,11 +92,11 @@ func experimentClientCounts(minClient int, maxClient int) []int {
 	return clientCounts
 }
 
-// Warm up with one client, then measure leaves when all clients access one shared Zipf address per trial.
+// Warm up with the configured clients, then measure leaves when all clients access one shared Zipf address per trial.
 func sharedAddressLeafDistribution(alpha float32, clientCount int, results chan<- experimentResult, experimentwg *sync.WaitGroup) {
 	defer experimentwg.Done()
 
-	server := NewSynchronizedMvpServer(z, l)
+	server := NewMvpServer(z, l)
 	positionmap := server.InitializeRandomData(n, seed)
 	go server.Run()
 
@@ -106,10 +106,9 @@ func sharedAddressLeafDistribution(alpha float32, clientCount int, results chan<
 		clients = append(clients, NewCientSet(client))
 	}
 
-	// Warm up the ORAM state with a single client using Zipf-selected addresses.
+	// Warm up the ORAM state with all configured clients issuing concurrent Zipf-selected accesses.
 	for i := 0; i < WarmUp; i++ {
-		op := opgenerater(alpha, len(clients[0].client.PositionMap)-1)
-		if err := clients[0].client.Access(op); err != nil {
+		if err := runConcurrentWarmupAccessTrial(clients, alpha); err != nil {
 			log.Printf("warmup access error: %v", err)
 			return
 		}
@@ -133,6 +132,30 @@ func sharedAddressLeafDistribution(alpha float32, clientCount int, results chan<
 		alpha:       alpha,
 		distance:    statisticalDistance(observedDistribution, randomDistribution),
 	}
+}
+
+func runConcurrentWarmupAccessTrial(clients []*client_set, alpha float32) error {
+	var wg sync.WaitGroup
+	errs := make(chan error, len(clients))
+	for _, clientSet := range clients {
+		op := opgenerater(alpha, len(clientSet.client.PositionMap)-1)
+		wg.Add(1)
+		go func(client *MvpClient, op OramOP) {
+			defer wg.Done()
+			if err := client.Access(op); err != nil {
+				errs <- err
+			}
+		}(clientSet.client, op)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func syncClientPositionMaps(clients []*client_set) {

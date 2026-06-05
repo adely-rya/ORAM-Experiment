@@ -8,7 +8,7 @@ func Normal() {
 		l           = 8
 		n           = 256
 		seed        = 542
-		clientCount = 1
+		clientCount = 10
 	)
 
 	server := NewMvpServer(z, l)
