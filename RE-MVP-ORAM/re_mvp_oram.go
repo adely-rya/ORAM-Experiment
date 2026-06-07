@@ -61,9 +61,9 @@ func (v *Version) increment() {
 }
 
 type Versions struct {
-	V Version // 最後の書き込み/読み込みバージョン
-	A Version // 最後の書き込み or 読み取り
-	S Version // 最後に移動されたバージョン
+	V Version // 最後の書き込みのバージョン
+	A Version // 最後の書き込み or 読み取りのバージョン
+	S Version // 最後に追加、削除、移動されたバージョン
 }
 
 func (ver *Versions) SetV(value Version) {
@@ -252,11 +252,6 @@ func (t MvpTree) Clone() MvpTree {
 		BucketReadCount: bucketReadCount,
 		TotalBucketRead: t.TotalBucketRead,
 	}
-}
-
-func (t *MvpTree) CountBucketRead(position MvpBucketPosition) {
-	t.BucketReadCount[position]++
-	t.TotalBucketRead++
 }
 
 type path struct {
@@ -591,13 +586,11 @@ func (r GetpsRequest) handle(s *MvpServer) {
 	}
 
 	path[mvpRootBucketPosition] = root
-	s.tree.CountBucketRead(mvpRootBucketPosition)
 
 	leaf := r.Leaf.bucket.String()
 	for len(leaf) != 0 {
 		bucketPosition := MvpBucketPosition(leaf)
 		path[bucketPosition] = tree.Tree[bucketPosition]
-		s.tree.CountBucketRead(bucketPosition)
 		leaf = leaf[:len(leaf)-1]
 	}
 
@@ -705,6 +698,8 @@ type MvpClient struct {
 	seq Version
 }
 
+var accessLoggingEnabled = true
+
 func NewMvpClient(l int, z int, clientID int, positionmap map[int]map[int]MvpPositionMapEntry, server chan<- ServerRequest) *MvpClient {
 	return &MvpClient{
 		L:           l,
@@ -762,8 +757,12 @@ func (c *MvpClient) Run(addrCount int) error {
 	for {
 		target := rand.Intn(addrCount)
 		param := fmt.Sprintf("client-%d-%d", c.ClientID, target)
+		operation := Read
+		if rand.Intn(2) == 0 {
+			operation = Write
+		}
 
-		err := c.Access(OramOP{Write, target, param})
+		err := c.Access(OramOP{operation, target, param})
 		if err != nil {
 			return err
 		}
@@ -782,7 +781,9 @@ func (c *MvpClient) Access(op OramOP) error {
 	if !ok {
 		return fmt.Errorf("no position map entry for addr %d", op.target)
 	}
-	log.Printf("access start: client=%d seq=%d op=%s addr=%d sig=%d position=%v", c.ClientID, version, op.OP, op.target, accessSig, accessEntry.Slot)
+	if accessLoggingEnabled {
+		log.Printf("access start: client=%d seq=%d op=%s addr=%d sig=%d position=%v", c.ClientID, version, op.OP, op.target, accessSig, accessEntry.Slot)
+	}
 
 	accessPosition := accessEntry.Slot
 
@@ -792,39 +793,105 @@ func (c *MvpClient) Access(op OramOP) error {
 	}
 
 	W := c.mergePathStashes() //ワーキングセット制作
-
-	targetBlock, ok := getWorkingBlock(W, op.target, accessSig)
-	if !ok {
-		return fmt.Errorf("Not target block in working set")
-	}
-
-	if op.OP == Write {
-		targetBlock.Data = op.param
-
-		targetBlock.Version = Versions{version, version, version}
-	} else {
-		targetBlock.Version.SetA(version)
-	}
-	setWorkingBlock(W, targetBlock)
+	c.debugWorkingSetDuplicates("after merge", W)
 
 	populatedPath, populatedStash, populatedPathMap := c.populatePath(W, op, accessSig)
+	c.debugEvictOutputDuplicates(populatedPath, populatedStash, populatedPathMap)
 
 	err = c.Evict(populatedPath, populatedPathMap, populatedStash)
 	if err != nil {
 		return err
 	}
-	log.Printf("access success: client=%d seq=%d op=%s addr=%d", c.ClientID, version, op.OP, op.target)
+	if accessLoggingEnabled {
+		log.Printf("access success: client=%d seq=%d op=%s addr=%d", c.ClientID, version, op.OP, op.target)
+	}
 
 	return nil
 }
 
 func (c *MvpClient) consolidatePathMaps(pathMaps []path) {
 	latestPathMap := make(map[pathKey]path, len(pathMaps))
+	maxversion := make(map[int]int)
+	currentMaxVersion := c.currentMaxWriteVersions()
+	updatesByAddr := make(map[int][]path)
 	for _, v := range pathMaps {
+		updatesByAddr[v.addr] = append(updatesByAddr[v.addr], v)
 		key := pathKey{addr: v.addr, sig: v.sig}
 		latest, ok := latestPathMap[key]
 		if !ok || newerPathUpdate(v, latest) {
 			latestPathMap[key] = v
+		}
+
+		if max, ok := maxversion[v.addr]; !ok || max < int(v.Ver.V) {
+			maxversion[v.addr] = int(v.Ver.V) //そのアドレスでwriteされた最大のバージョンを保持
+		}
+	}
+
+	for key, path := range latestPathMap { //そのアドレスでwriteされた最大バージョンの追加パス、移動パスを排除
+		if _, ok := c.PositionMap[path.addr][path.sig]; int(path.Ver.V) < maxversion[key.addr] && !ok {
+			delete(latestPathMap, key)
+			continue
+		}
+		if currentMax, ok := currentMaxVersion[key.addr]; ok && path.Ver.V < currentMax && !path.delete {
+			delete(latestPathMap, key)
+		}
+	}
+
+	latestStashVersion := make(map[int]Versions)
+	for _, path := range latestPathMap {
+		if path.delete || path.to != mvpStashPosition {
+			continue
+		}
+		if current, ok := latestStashVersion[path.addr]; !ok || newerVersions(path.Ver, current) {
+			latestStashVersion[path.addr] = path.Ver
+		}
+	}
+	for key, path := range latestPathMap {
+		latest, ok := latestStashVersion[path.addr]
+		if !ok || path.delete || path.to != mvpStashPosition {
+			continue
+		}
+		if newerVersions(latest, path.Ver) {
+			if c.PositionMap[path.addr] != nil {
+				delete(c.PositionMap[path.addr], path.sig)
+				if len(c.PositionMap[path.addr]) == 0 {
+					delete(c.PositionMap, path.addr)
+				}
+			}
+			delete(latestPathMap, key)
+		}
+	}
+	for addr, version := range latestStashVersion {
+		for sig, entry := range c.PositionMap[addr] {
+			if entry.Slot == mvpStashPosition && newerVersions(version, entry.Ts) {
+				delete(c.PositionMap[addr], sig)
+			}
+		}
+		if len(c.PositionMap[addr]) == 0 {
+			delete(c.PositionMap, addr)
+		}
+	}
+
+	observedMaxVersion := make(map[int]Version, len(currentMaxVersion))
+	for addr, version := range currentMaxVersion {
+		observedMaxVersion[addr] = version
+	}
+	for _, path := range latestPathMap {
+		if path.delete {
+			continue
+		}
+		if current, ok := observedMaxVersion[path.addr]; !ok || path.Ver.V > current {
+			observedMaxVersion[path.addr] = path.Ver.V
+		}
+	}
+	for addr, version := range observedMaxVersion {
+		for sig, entry := range c.PositionMap[addr] {
+			if entry.Ts.V < version {
+				delete(c.PositionMap[addr], sig)
+			}
+		}
+		if len(c.PositionMap[addr]) == 0 {
+			delete(c.PositionMap, addr)
 		}
 	}
 
@@ -835,6 +902,7 @@ func (c *MvpClient) consolidatePathMaps(pathMaps []path) {
 		if v.delete {
 			delete(c.PositionMap[v.addr], v.sig)
 			if len(c.PositionMap[v.addr]) == 0 {
+				log.Printf("debug positionmap addr emptied: client=%d addr=%d deleted_sig=%d path_seq=%d path_ver=%+v maxV=%d incoming_updates=%s", c.ClientID, v.addr, v.sig, v.Seq, v.Ver, maxversion[v.addr], formatDebugPaths(updatesByAddr[v.addr]))
 				delete(c.PositionMap, v.addr)
 			}
 			continue
@@ -845,6 +913,29 @@ func (c *MvpClient) consolidatePathMaps(pathMaps []path) {
 			c.PositionMap[v.addr][v.sig] = MvpPositionMapEntry{Slot: v.to, Ts: v.Ver}
 		}
 	}
+}
+
+func (c *MvpClient) currentMaxWriteVersions() map[int]Version {
+	maxVersions := make(map[int]Version, len(c.PositionMap))
+	for addr, entries := range c.PositionMap {
+		for _, entry := range entries {
+			if current, ok := maxVersions[addr]; !ok || entry.Ts.V > current {
+				maxVersions[addr] = entry.Ts.V
+			}
+		}
+	}
+	return maxVersions
+}
+
+func formatDebugPaths(paths []path) string {
+	formatted := ""
+	for index, path := range paths {
+		if index > 0 {
+			formatted += "; "
+		}
+		formatted += fmt.Sprintf("{addr=%d sig=%d delete=%v to=%v ver=%+v seq=%d}", path.addr, path.sig, path.delete, path.to, path.Ver, path.Seq)
+	}
+	return formatted
 }
 
 func (c *MvpClient) choosePositionMapEntry(addr int) (int, MvpPositionMapEntry, bool) {
@@ -906,11 +997,13 @@ func selectPath(accessPosition any, pathlen int) MvpPosition {
 
 func (c *MvpClient) mergePathStashes() map[int][]MvpDataBlock {
 	W := make(map[int][]MvpDataBlock, 0)
+	seen := make(map[pathKey]string)
 
-	for _, v := range c.Stash {
-		for _, block := range v {
+	for stashVersion, v := range c.Stash {
+		for index, block := range v {
 			pm, ok := c.PositionMap[block.Addr][block.signature]
 			if ok && pm.Slot == mvpStashPosition && sameDataVersion(pm.Ts, block.Version) {
+				c.debugMergedBlockDuplicate(seen, block, fmt.Sprintf("stash[%d][%d]", stashVersion, index), pm)
 				appendWorkingBlock(W, block)
 			}
 		}
@@ -918,7 +1011,7 @@ func (c *MvpClient) mergePathStashes() map[int][]MvpDataBlock {
 
 	for bucketPosition, bucket := range c.path {
 		for slotPosition, versionedSlots := range bucket.Slots {
-			for _, slot := range versionedSlots {
+			for slotVersion, slot := range versionedSlots {
 				if slot.IsEmpty() {
 					continue
 				}
@@ -927,6 +1020,7 @@ func (c *MvpClient) mergePathStashes() map[int][]MvpDataBlock {
 				pm, ok := c.PositionMap[block.Addr][block.signature]
 				blockPosition := MvpPosition{bucket: bucketPosition, slot: slotPosition}
 				if ok && pm.Slot == blockPosition && sameDataVersion(pm.Ts, block.Version) {
+					c.debugMergedBlockDuplicate(seen, block, fmt.Sprintf("path[%s/%d][slotVersion=%d]", bucketPosition, slotPosition, slotVersion), pm)
 					appendWorkingBlock(W, block)
 				}
 			}
@@ -934,6 +1028,62 @@ func (c *MvpClient) mergePathStashes() map[int][]MvpDataBlock {
 	}
 
 	return W
+}
+
+func (c *MvpClient) debugMergedBlockDuplicate(seen map[pathKey]string, block MvpDataBlock, source string, pm MvpPositionMapEntry) {
+	key := pathKey{addr: block.Addr, sig: block.signature}
+	if previous, ok := seen[key]; ok {
+		log.Printf("debug duplicate merge source: client=%d seq=%d addr=%d sig=%d previous=%s current=%s block_ver=%+v pm_slot=%v pm_ts=%+v", c.ClientID, c.seq, block.Addr, block.signature, previous, source, block.Version, pm.Slot, pm.Ts)
+		return
+	}
+	seen[key] = source
+}
+
+func (c *MvpClient) debugWorkingSetDuplicates(stage string, W map[int][]MvpDataBlock) {
+	for addr, blocks := range W {
+		seen := make(map[int]MvpDataBlock, len(blocks))
+		for _, block := range blocks {
+			if previous, ok := seen[block.signature]; ok {
+				log.Printf("debug duplicate W: client=%d seq=%d stage=%s addr=%d sig=%d previous_ver=%+v current_ver=%+v count=%d", c.ClientID, c.seq, stage, addr, block.signature, previous.Version, block.Version, len(blocks))
+				continue
+			}
+			seen[block.signature] = block
+		}
+	}
+}
+
+func (c *MvpClient) debugEvictOutputDuplicates(pathOutput map[MvpPosition]MvpSlot, stash []MvpDataBlock, pathMap []path) {
+	seenBlocks := make(map[pathKey]string)
+	for position, slot := range pathOutput {
+		if slot.IsEmpty() {
+			continue
+		}
+		block := slot.Value
+		key := pathKey{addr: block.Addr, sig: block.signature}
+		source := fmt.Sprintf("pathOutput[%v/%d]", position.bucket, position.slot)
+		if previous, ok := seenBlocks[key]; ok {
+			log.Printf("debug duplicate evict block output: client=%d seq=%d addr=%d sig=%d previous=%s current=%s block_ver=%+v", c.ClientID, c.seq, block.Addr, block.signature, previous, source, block.Version)
+		}
+		seenBlocks[key] = source
+	}
+	for index, block := range stash {
+		key := pathKey{addr: block.Addr, sig: block.signature}
+		source := fmt.Sprintf("stashOutput[%d]", index)
+		if previous, ok := seenBlocks[key]; ok {
+			log.Printf("debug duplicate evict block output: client=%d seq=%d addr=%d sig=%d previous=%s current=%s block_ver=%+v", c.ClientID, c.seq, block.Addr, block.signature, previous, source, block.Version)
+		}
+		seenBlocks[key] = source
+	}
+
+	seenPathMap := make(map[pathKey]path)
+	for _, update := range pathMap {
+		key := pathKey{addr: update.addr, sig: update.sig}
+		previous, ok := seenPathMap[key]
+		if ok && previous.delete != update.delete && previous.Seq == update.Seq && previous.Ver.V == update.Ver.V && previous.Ver.A == update.Ver.A {
+			log.Printf("debug conflicting pathmap output: client=%d seq=%d addr=%d sig=%d previous_delete=%t previous_to=%v previous_ver=%+v current_delete=%t current_to=%v current_ver=%+v", c.ClientID, c.seq, update.addr, update.sig, previous.delete, previous.to, previous.Ver, update.delete, update.to, update.Ver)
+		}
+		seenPathMap[key] = update
+	}
 }
 
 func appendWorkingBlock(W map[int][]MvpDataBlock, block MvpDataBlock) {
@@ -976,14 +1126,6 @@ func removeWorkingBlock(W map[int][]MvpDataBlock, block MvpDataBlock) {
 	}
 }
 
-func flattenWorkingSet(W map[int][]MvpDataBlock) []MvpDataBlock {
-	blocks := make([]MvpDataBlock, 0)
-	for _, addrBlocks := range W {
-		blocks = append(blocks, addrBlocks...)
-	}
-	return blocks
-}
-
 func newerVersions(left Versions, right Versions) bool {
 	if left.V != right.V {
 		return left.V > right.V
@@ -995,7 +1137,7 @@ func newerVersions(left Versions, right Versions) bool {
 }
 
 func sameDataVersion(left Versions, right Versions) bool {
-	return left.V == right.V && left.A == right.A
+	return left.V == right.V && left.A == right.A && left.S == right.S
 }
 
 func newerPathUpdate(left path, right path) bool {
@@ -1067,6 +1209,201 @@ func sort_position(positionList []MvpPosition) []MvpPosition {
 	return positionList
 }
 
+func (c *MvpClient) evaluationPathpattern(addrlist []int, path_list []path) map[int]int {
+	positionMap := clonePositionMap(c.PositionMap)
+	applyPathMapsToPositionMap(positionMap, path_list)
+
+	result := make(map[int]int, len(addrlist))
+	for _, addr := range addrlist {
+		for _, entry := range positionMap[addr] {
+			if entry.Slot.bucket == mvpRootBucketPosition || entry.Slot.bucket == mvpStashBucketPosition {
+				continue
+			}
+			result[addr] += pathPatternCount(entry.Slot, c.L)
+		}
+	}
+	return result
+}
+
+func applyPathMapsToPositionMap(positionMap map[int]map[int]MvpPositionMapEntry, pathMaps []path) {
+	for _, v := range pathMaps {
+		if positionMap[v.addr] == nil {
+			positionMap[v.addr] = make(map[int]MvpPositionMapEntry, 1)
+		}
+		if v.delete {
+			delete(positionMap[v.addr], v.sig)
+			if len(positionMap[v.addr]) == 0 {
+				delete(positionMap, v.addr)
+			}
+			continue
+		}
+
+		positionMap[v.addr][v.sig] = MvpPositionMapEntry{Slot: v.to, Ts: v.Ver}
+	}
+}
+
+func pathPatternCount(position MvpPosition, pathLen int) int {
+	switch position.bucket {
+	case mvpRootBucketPosition, mvpStashBucketPosition:
+		return 1 << pathLen
+	default:
+		depth := len(position.bucket.String())
+		if depth <= 0 || depth > pathLen {
+			return 1 << pathLen
+		}
+		return 1 << (pathLen - depth)
+	}
+}
+
+func emptySlotsFromPath(allSlot []MvpPosition, populatedPath map[MvpPosition]MvpSlot) []MvpPosition {
+	emptySlot := make([]MvpPosition, 0)
+	for _, position := range allSlot {
+		if populatedPath[position].IsEmpty() {
+			emptySlot = append(emptySlot, position)
+		}
+	}
+	return emptySlot
+}
+
+func (c *MvpClient) fillEmptySlotsWithCopiedBlocks(emptySlot []MvpPosition, evaluationResult map[int]int, copySource map[int]MvpDataBlock, targetAddr int, populatedPath map[MvpPosition]MvpSlot, populatedPathMap *[]path) {
+	if len(emptySlot) == 0 || len(evaluationResult) == 0 {
+		return
+	}
+
+	addrs := make([]int, 0, len(evaluationResult))
+	for addr := range evaluationResult {
+		if _, ok := copySource[addr]; ok {
+			addrs = append(addrs, addr)
+		}
+	}
+	if len(addrs) == 0 {
+		return
+	}
+	sort.Slice(addrs, func(i, j int) bool {
+		left := evaluationResult[addrs[i]]
+		right := evaluationResult[addrs[j]]
+		if left != right {
+			return left < right
+		}
+		return addrs[i] < addrs[j]
+	})
+
+	usedSignatures := make(map[int]map[int]struct{}, len(addrs))
+	for _, addr := range addrs {
+		usedSignatures[addr] = make(map[int]struct{}, len(c.PositionMap[addr])+1)
+		for sig := range c.PositionMap[addr] {
+			usedSignatures[addr][sig] = struct{}{}
+		}
+	}
+
+	addrIndex := 0
+	for slotIndex := 0; slotIndex < len(emptySlot); slotIndex++ {
+		for slotIndex < len(emptySlot) && !populatedPath[emptySlot[slotIndex]].IsEmpty() {
+			slotIndex++
+		}
+		if slotIndex >= len(emptySlot) {
+			return
+		}
+
+		addr := addrs[addrIndex%len(addrs)]
+		addrIndex++
+		source := copySource[addr]
+		copied := source
+		copied.signature = newCopiedSignature(usedSignatures[addr])
+		copied.Version = copiedBlockVersion(source, targetAddr, c.seq)
+
+		position := emptySlot[slotIndex]
+		slot := NewMvpSlot(c.seq)
+		slot.SetBlock(copied)
+		populatedPath[position] = slot
+
+		*populatedPathMap = append(*populatedPathMap, newPath(copied.Addr, copied.signature, position, positionMapVersion(copied.Version, c.seq), c.seq))
+	}
+}
+
+func newCopiedSignature(used map[int]struct{}) int {
+	for {
+		sig := rand.Int()
+		if _, ok := used[sig]; !ok {
+			used[sig] = struct{}{}
+			return sig
+		}
+	}
+}
+
+func copiedBlockVersion(source MvpDataBlock, targetAddr int, seq Version) Versions {
+	version := Versions{
+		V: source.Version.V,
+		A: source.Version.A,
+		S: seq,
+	}
+	if source.Addr == targetAddr {
+		version.V = seq
+		version.A = seq
+	}
+	return version
+}
+
+func (c *MvpClient) debugTargetMiss(addr int, sig int, W map[int][]MvpDataBlock) {
+	log.Printf("debug target miss: client=%d seq=%d addr=%d sig=%d pm_entries=%s W_addr=%s path_addr=%s stash_addr=%s", c.ClientID, c.seq, addr, sig, formatDebugPositionMapEntries(c.PositionMap[addr]), formatDebugBlocks(W[addr]), c.debugPathBlocksForAddr(addr), c.debugStashBlocksForAddr(addr))
+}
+
+func formatDebugPositionMapEntries(entries map[int]MvpPositionMapEntry) string {
+	if len(entries) == 0 {
+		return "[]"
+	}
+	formatted := "["
+	index := 0
+	for sig, entry := range entries {
+		if index > 0 {
+			formatted += "; "
+		}
+		formatted += fmt.Sprintf("{sig=%d slot=%v ts=%+v}", sig, entry.Slot, entry.Ts)
+		index++
+	}
+	return formatted + "]"
+}
+
+func formatDebugBlocks(blocks []MvpDataBlock) string {
+	if len(blocks) == 0 {
+		return "[]"
+	}
+	formatted := "["
+	for index, block := range blocks {
+		if index > 0 {
+			formatted += "; "
+		}
+		formatted += fmt.Sprintf("{addr=%d sig=%d ver=%+v}", block.Addr, block.signature, block.Version)
+	}
+	return formatted + "]"
+}
+
+func (c *MvpClient) debugPathBlocksForAddr(addr int) string {
+	blocks := make([]MvpDataBlock, 0)
+	for _, bucket := range c.path {
+		for _, versionedSlots := range bucket.Slots {
+			for _, slot := range versionedSlots {
+				if !slot.IsEmpty() && slot.Value.Addr == addr {
+					blocks = append(blocks, slot.Value)
+				}
+			}
+		}
+	}
+	return formatDebugBlocks(blocks)
+}
+
+func (c *MvpClient) debugStashBlocksForAddr(addr int) string {
+	blocks := make([]MvpDataBlock, 0)
+	for _, stash := range c.Stash {
+		for _, block := range stash {
+			if block.Addr == addr {
+				blocks = append(blocks, block)
+			}
+		}
+	}
+	return formatDebugBlocks(blocks)
+}
+
 func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig int) (map[MvpPosition]MvpSlot, []MvpDataBlock, []path) {
 	// 返却するpathはslot単位でサーバーへ渡すので、実際の書き込み位置はMvpPositionで持つ。
 	populatedPath := make(map[MvpPosition]MvpSlot, c.L+1)
@@ -1085,16 +1422,42 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 	// アクセス対象ブロックが初回配置されたかどうかを記録する。
 	targetPlaced := false
 
+	targetBlock, ok := getWorkingBlock(W, op.target, targetSig)
+	if ok {
+		targetBlock.Version.SetA(c.seq)
+	} else {
+		c.debugTargetMiss(op.target, targetSig, W)
+		log.Panicln("Not target block in working set")
+	}
+
 	if op.OP == Write {
-		if targetBlock, ok := getWorkingBlock(W, op.target, targetSig); ok {
-			W[op.target] = []MvpDataBlock{targetBlock}
-		}
+		targetBlock.Data = op.param
+		targetBlock.Version.SetV(c.seq)
 		for sig := range c.PositionMap[op.target] {
 			if sig == targetSig {
 				continue
 			}
 			path := newDeletePath(op.target, sig, Versions{V: c.seq, A: c.seq, S: c.seq}, c.seq)
-			delete(c.PositionMap[op.target], sig)
+			populatedPathMap = append(populatedPathMap, path)
+		}
+		W[op.target] = []MvpDataBlock{targetBlock}
+	}
+
+	compactW := make(map[int]MvpDataBlock, c.L*c.Z)
+	compactWCopySource := make(map[int]MvpDataBlock, c.L*c.Z)
+	addrlist := make([]int, 0, c.L*c.Z)
+	for addr, blocks := range W {
+		addrlist = append(addrlist, addr)
+		blocks = sort_block(blocks)
+		compactW[addr] = blocks[len(blocks)-1]
+		compactWCopySource[addr] = blocks[len(blocks)-1]
+
+		for index, block := range blocks {
+			if index == len(blocks)-1 {
+				continue
+			}
+
+			path := newDeletePath(block.Addr, block.signature, Versions{V: block.Version.V, A: block.Version.A, S: c.seq}, c.seq)
 			populatedPathMap = append(populatedPathMap, path)
 		}
 	}
@@ -1110,7 +1473,7 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 			// このbucketに所属するブロック候補をWから集める。
 			candidates := make([]MvpDataBlock, 0, len(W))
 			// W内の各ブロックを確認する。
-			for _, block := range flattenWorkingSet(W) {
+			for _, block := range compactW {
 				// PositionMapがこのexact slotを指すブロックだけを候補にする。
 				if pm, ok := c.PositionMap[block.Addr][block.signature]; ok && pm.Slot == position {
 					candidates = append(candidates, block)
@@ -1139,14 +1502,14 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 				targetPlaced = true
 			}
 			// 選んだブロックはWから取り除き、同じブロックを複数slotへ置かないようにする。
-			removeWorkingBlock(W, selected)
+			delete(compactW, selected.Addr)
 		}
 	}
 
 	// stashからpathへ戻す候補を作る。
-	blockList := make([]MvpDataBlock, 0, len(W))
+	blockList := make([]MvpDataBlock, 0, len(compactW))
 	// Wに残ったブロックを走査する。
-	for _, block := range flattenWorkingSet(W) {
+	for _, block := range compactW {
 		// アクセス対象ブロックはstashへ退避するので、pathへ戻す候補から外す。
 		if block.Addr == op.target {
 			continue
@@ -1203,12 +1566,14 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 		// swap候補ブロックが残っていれば、このslotへ入れる。
 		if len(swapCandidate) > index {
 			newslot.SetBlock(swapCandidate[index])
+			delete(compactW, swapCandidate[index].Addr)
 			removeWorkingBlock(W, swapCandidate[index])
 		}
 		// swap前のslotにブロックがあれば、stashへ戻すためにWへ戻す。
 		if !slot.IsEmpty() {
 			swaped := slot.Value
 			appendWorkingBlock(W, swaped)
+			compactW[swaped.Addr] = swaped
 		}
 		// swap後のslotをpath出力へ反映する。
 		populatedPath[slotPosition] = newslot
@@ -1245,6 +1610,8 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 		slot := NewMvpSlot(c.seq)
 		// root側から順に置くブロックを取り出す。
 		block := onPathBlock[index]
+
+		block.Version.SetS(c.seq)
 		// ブロックをslotへ入れる。
 		slot.SetBlock(block)
 		// path出力へslotを書き戻す。
@@ -1256,18 +1623,19 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 	}
 
 	// pathへ残らなかったブロックをstashへ入れる。
-	for _, block := range flattenWorkingSet(W) {
+	for _, block := range compactW {
+		block.Version.SetS(c.seq)
 		// 新しいstash出力へブロックを追加する。
 		populatedStash = append(populatedStash, block)
-		current, ok := c.PositionMap[block.Addr][block.signature]
-		if ok && current.Slot == mvpStashPosition && sameDataVersion(current.Ts, block.Version) {
-			continue
-		}
 		// PositionMap更新はstash位置として記録する。
 		path := newPath(block.Addr, block.signature, mvpStashPosition, positionMapVersion(block.Version, c.seq), c.seq)
 		// PathMapへstash位置の更新を追加する。
 		populatedPathMap = append(populatedPathMap, path)
 	}
+
+	emptySlot := emptySlotsFromPath(allSlot, populatedPath)
+	evaluationResult := c.evaluationPathpattern(addrlist, populatedPathMap)
+	c.fillEmptySlotsWithCopiedBlocks(emptySlot, evaluationResult, compactWCopySource, op.target, populatedPath, &populatedPathMap)
 
 	// 新しいpath、新しいstash、新しいPathMapを返す。
 	return populatedPath, populatedStash, populatedPathMap

@@ -2,25 +2,27 @@
 package main
 
 import (
-	"fmt"
+	"encoding/csv"
 	"log"
 	"math"
 	"math/rand"
-	"sort"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 )
 
 const (
-	z          = 4
-	l          = 12
-	n          = 1 << 12
-	seed       = 542
-	WarmUp     = 200
-	MonteCarlo = 20000
-	minClient  = 1
-	maxClient  = 20
+	z                  = 4
+	l                  = 12
+	n                  = 1 << 12
+	seed               = 542
+	WarmUp             = 200
+	MonteCarlo         = 20000
+	minClient          = 1
+	maxClient          = 20
+	experiment3CSVPath = "CSV/re_mvp_oram_experiment3.csv"
 )
 
 var experimentAlphas = []float32{0.1, 1.9}
@@ -36,6 +38,8 @@ type experimentResult struct {
 	clientCount int
 	alpha       float32
 	distance    float64
+	elapsed     time.Duration
+	err         error
 }
 
 func NewCientSet(client *MvpClient) *client_set {
@@ -44,38 +48,89 @@ func NewCientSet(client *MvpClient) *client_set {
 
 func Experiment3() {
 	clientCounts := experimentClientCounts(minClient, maxClient)
-	results := make(chan experimentResult, len(clientCounts)*len(experimentAlphas))
+	accessLoggingEnabled = false
+	defer func() {
+		accessLoggingEnabled = true
+	}()
 
-	var experimentwg sync.WaitGroup
+	if err := os.MkdirAll(filepath.Dir(experiment3CSVPath), 0755); err != nil {
+		log.Printf("experiment3 csv directory create error: %v", err)
+		return
+	}
+
+	file, err := os.Create(experiment3CSVPath)
+	if err != nil {
+		log.Printf("experiment3 csv create error: %v", err)
+		return
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	if err := writer.Write([]string{"client_count", "alpha", "k_distribution_statistical_distance"}); err != nil {
+		log.Printf("experiment3 csv header write error: %v", err)
+		return
+	}
+	if err := flushExperiment3CSV(writer, file); err != nil {
+		log.Printf("experiment3 csv header flush error: %v", err)
+		return
+	}
+
+	totalExperiments := len(clientCounts) * len(experimentAlphas)
+	completedExperiments := 0
+	log.Printf("experiment3 progress: start total=%d client_counts=%v alphas=%v csv=%s", totalExperiments, clientCounts, experimentAlphas, experiment3CSVPath)
+
 	for _, clientCount := range clientCounts {
+		results := make(chan experimentResult, len(experimentAlphas))
+		var experimentwg sync.WaitGroup
+		log.Printf("experiment3 progress: client_count=%d start alpha_experiments=%d", clientCount, len(experimentAlphas))
+
 		for _, alpha := range experimentAlphas {
 			experimentwg.Add(1)
 			go sharedAddressLeafDistribution(alpha, clientCount, results, &experimentwg)
 		}
+
+		go func() {
+			experimentwg.Wait()
+			close(results)
+		}()
+
+		for result := range results {
+			completedExperiments++
+			if result.err != nil {
+				log.Printf("experiment3 progress: failed client_count=%d alpha=%.6f completed=%d/%d elapsed=%s err=%v", result.clientCount, result.alpha, completedExperiments, totalExperiments, result.elapsed.Round(time.Millisecond), result.err)
+				continue
+			}
+
+			if err := writeExperiment3Result(writer, file, result); err != nil {
+				log.Printf("experiment3 csv write error: client_count=%d alpha=%.6f err=%v", result.clientCount, result.alpha, err)
+				return
+			}
+			log.Printf("experiment3 progress: csv flushed client_count=%d alpha=%.6f distance=%.10f completed=%d/%d elapsed=%s", result.clientCount, result.alpha, result.distance, completedExperiments, totalExperiments, result.elapsed.Round(time.Millisecond))
+		}
+
+		log.Printf("experiment3 progress: client_count=%d done completed=%d/%d", clientCount, completedExperiments, totalExperiments)
 	}
 
-	experimentwg.Wait()
-	close(results)
-
-	printExperimentDistanceResults(results, len(clientCounts)*len(experimentAlphas))
+	log.Printf("experiment3 progress: done csv=%s completed=%d/%d", experiment3CSVPath, completedExperiments, totalExperiments)
 }
 
-func printExperimentDistanceResults(results <-chan experimentResult, resultCount int) {
-	ordered := make([]experimentResult, 0, resultCount)
-	for result := range results {
-		ordered = append(ordered, result)
+func writeExperiment3Result(writer *csv.Writer, file *os.File, result experimentResult) error {
+	if err := writer.Write([]string{
+		strconv.Itoa(result.clientCount),
+		strconv.FormatFloat(float64(result.alpha), 'f', 6, 32),
+		strconv.FormatFloat(result.distance, 'f', 10, 64),
+	}); err != nil {
+		return err
 	}
-	sort.Slice(ordered, func(i, j int) bool {
-		if ordered[i].clientCount != ordered[j].clientCount {
-			return ordered[i].clientCount < ordered[j].clientCount
-		}
-		return ordered[i].alpha < ordered[j].alpha
-	})
+	return flushExperiment3CSV(writer, file)
+}
 
-	fmt.Println("client_count,alpha,k_distribution_statistical_distance")
-	for _, result := range ordered {
-		fmt.Printf("%d,%.6f,%.10f\n", result.clientCount, result.alpha, result.distance)
+func flushExperiment3CSV(writer *csv.Writer, file *os.File) error {
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return err
 	}
+	return file.Sync()
 }
 
 // Build the client-count series: 1 if requested, then 5, 10, ... up to maxClient.
@@ -95,6 +150,8 @@ func experimentClientCounts(minClient int, maxClient int) []int {
 // Warm up with the configured clients, then measure leaves when all clients access one shared Zipf address per trial.
 func sharedAddressLeafDistribution(alpha float32, clientCount int, results chan<- experimentResult, experimentwg *sync.WaitGroup) {
 	defer experimentwg.Done()
+	startedAt := time.Now()
+	log.Printf("experiment3 progress: start client_count=%d alpha=%.6f warmup=%d monte_carlo=%d", clientCount, alpha, WarmUp, MonteCarlo)
 
 	server := NewMvpServer(z, l)
 	positionmap := server.InitializeRandomData(n, seed)
@@ -109,10 +166,11 @@ func sharedAddressLeafDistribution(alpha float32, clientCount int, results chan<
 	// Warm up the ORAM state with all configured clients issuing concurrent Zipf-selected accesses.
 	for i := 0; i < WarmUp; i++ {
 		if err := runConcurrentWarmupAccessTrial(clients, alpha); err != nil {
-			log.Printf("warmup access error: %v", err)
+			results <- experimentResult{clientCount: clientCount, alpha: alpha, elapsed: time.Since(startedAt), err: err}
 			return
 		}
 	}
+	log.Printf("experiment3 progress: warmup done client_count=%d alpha=%.6f elapsed=%s", clientCount, alpha, time.Since(startedAt).Round(time.Millisecond))
 
 	// Pull warmup PathMaps so every measuring client starts from the same PositionMap.
 	syncClientPositionMaps(clients)
@@ -131,7 +189,9 @@ func sharedAddressLeafDistribution(alpha float32, clientCount int, results chan<
 		clientCount: clientCount,
 		alpha:       alpha,
 		distance:    statisticalDistance(observedDistribution, randomDistribution),
+		elapsed:     time.Since(startedAt),
 	}
+	log.Printf("experiment3 progress: measurement done client_count=%d alpha=%.6f elapsed=%s", clientCount, alpha, time.Since(startedAt).Round(time.Millisecond))
 }
 
 func runConcurrentWarmupAccessTrial(clients []*client_set, alpha float32) error {

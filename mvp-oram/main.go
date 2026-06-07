@@ -18,6 +18,9 @@ func main() {
 	case "experiment3":
 		log.Println("experiment3 running...")
 		Experiment3()
+	case "experiment4":
+		log.Println("experiment4 running...")
+		Experiment4()
 	default:
 		panic("Not setting experiment")
 	}
