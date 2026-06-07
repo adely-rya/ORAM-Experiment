@@ -195,7 +195,12 @@ func getPSOnly(c *client_set, op OramOP, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	client := c.client
-	accessPosition := client.PositionMap[op.target].Slot
+	_, accessEntry, ok := client.choosePositionMapEntry(op.target)
+	if !ok {
+		log.Printf("missing position map entry for addr %d", op.target)
+		return
+	}
+	accessPosition := accessEntry.Slot
 	leaf := client.selectPath(accessPosition, client.L)
 	c.selectedPosition = leaf
 
