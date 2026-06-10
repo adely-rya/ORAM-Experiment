@@ -1,23 +1,37 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"strconv"
+)
 
 func Normal() {
 	const (
 		z           = 4
-		l           = 8
-		n           = 256
+		l           = 12
+		n           = 1 << 12
 		seed        = 542
-		clientCount = 10
+		clientCount = 50
 	)
+
+	measuredClientCount := clientCount
+	if value := os.Getenv("RE_MVP_CLIENT_COUNT"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			measuredClientCount = parsed
+		}
+	}
+	if os.Getenv("RE_MVP_ACCESS_LOG") == "0" {
+		accessLoggingEnabled = false
+	}
 
 	server := NewMvpServer(z, l)
 	positionmap := server.InitializeRandomData(n, seed)
 
 	go server.Run()
 
-	errs := make(chan error, clientCount)
-	for clientID := 0; clientID < clientCount; clientID++ {
+	errs := make(chan error, measuredClientCount)
+	for clientID := 0; clientID < measuredClientCount; clientID++ {
 		client := NewMvpClient(
 			l,
 			z,

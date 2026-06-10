@@ -1,15 +1,33 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"strconv"
+)
 
 func Normal() {
-	const (
-		z           = 4
-		l           = 8
-		n           = 256
-		seed        = 542
-		clientCount = 10
-	)
+	const seed = 542
+	z := 4
+	l := 8
+	n := 256
+	clientCount := 10
+
+	if value := os.Getenv("MVP_L"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			l = parsed
+		}
+	}
+	if value := os.Getenv("MVP_N"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			n = parsed
+		}
+	}
+	if value := os.Getenv("MVP_CLIENT_COUNT"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			clientCount = parsed
+		}
+	}
 
 	server := NewMvpServer(z, l)
 	positionmap := server.InitializeRandomData(n, seed)

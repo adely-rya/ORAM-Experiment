@@ -18,6 +18,7 @@ const (
 	mvpInitialVersion                     Version           = 0
 	mvpDefaultPathMapCompactInterval                        = 10000
 	mvpDefaultPathMapCompactProtectedTail                   = 2000
+	mvpStashMetricsInterval                                 = 100
 )
 
 var (
@@ -645,6 +646,7 @@ func (r EvictReques) handle(s *MvpServer) {
 		}
 	}
 	s.Stashs[int(r.Seq)] = r.Stash
+	s.logStashMetrics(r)
 
 	for _, path := range r.PathMap {
 		s.PathMaps = append(s.PathMaps, path)
@@ -658,6 +660,40 @@ func (r EvictReques) handle(s *MvpServer) {
 	r.Reply <- EvictResponse{
 		Err: nil,
 	}
+}
+
+func (s *MvpServer) logStashMetrics(r EvictReques) {
+	if mvpStashMetricsInterval <= 0 || int(r.Seq)%mvpStashMetricsInterval != 0 {
+		return
+	}
+
+	pathBlocks := 0
+	for _, slot := range r.Path {
+		if !slot.IsEmpty() {
+			pathBlocks++
+		}
+	}
+
+	totalStashBlocks := 0
+	maxStashVersionBlocks := 0
+	for _, stash := range s.Stashs {
+		totalStashBlocks += len(stash)
+		if len(stash) > maxStashVersionBlocks {
+			maxStashVersionBlocks = len(stash)
+		}
+	}
+
+	log.Printf(
+		"mvp stash metrics: seq=%d client=%d path_out=%d stash_out=%d stash_versions=%d stash_total=%d stash_max_version=%d pathmap_updates=%d",
+		r.Seq,
+		r.ClientID,
+		pathBlocks,
+		len(r.Stash),
+		len(s.Stashs),
+		totalStashBlocks,
+		maxStashVersionBlocks,
+		len(r.PathMap),
+	)
 }
 
 type MvpClient struct {
@@ -784,6 +820,7 @@ func (c *MvpClient) Access(op OramOP) error {
 
 func (c *MvpClient) consolidatePathMaps(pathMaps []path) {
 	latestPathMap := make(map[int]path, len(pathMaps))
+	// 受信したPathMapから、アドレスごとの最新更新だけを残す。
 	for _, v := range pathMaps {
 		latest, ok := latestPathMap[v.addr]
 		if !ok || newerPathUpdate(v, latest) {
@@ -791,6 +828,7 @@ func (c *MvpClient) consolidatePathMaps(pathMaps []path) {
 		}
 	}
 
+	// 最新更新をPositionMapへ反映する。現在のPositionMapより新しい更新だけを上書きする。
 	for _, v := range latestPathMap {
 		current, ok := c.PositionMap[v.addr]
 		if !ok || newerPositionUpdate(v, current) {
@@ -958,6 +996,7 @@ func sort_position(positionList []MvpPosition) []MvpPosition {
 }
 
 func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosition]MvpSlot, []MvpDataBlock, []path) {
+	wBlockCount := len(W)
 	// 返却するpathはslot単位でサーバーへ渡すので、実際の書き込み位置はMvpPositionで持つ。
 	populatedPath := make(map[MvpPosition]MvpSlot, c.L+1)
 	// 返却するstashは、pathへ残らなかったブロックだけを入れる。
@@ -976,6 +1015,8 @@ func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosi
 	targetPlaced := false
 
 	// 読み込んだpath上の各bucketを走査する。
+	initialPlaced := 0
+	initialCandidateSlots := 0
 	for bucketPosition := range c.path {
 		// bucket内の各slotを順番に埋める。
 		for i := 0; i < c.Z; i++ {
@@ -997,6 +1038,7 @@ func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosi
 				populatedPath[position] = NewMvpSlot(c.seq)
 				continue
 			}
+			initialCandidateSlots++
 			// 同じbucketに複数候補がある場合はversion順に並べる。
 			candidates = sort_block(candidates)
 			// 一番新しいversionのブロックをこのslotに置く。
@@ -1009,6 +1051,7 @@ func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosi
 			populatedPath[position] = slot
 			// このslotは後段のshuffleで使えるslotとして覚える。
 			usedSlot = append(usedSlot, position)
+			initialPlaced++
 			// アクセス対象ブロックを置いたslotなら、その実slotを覚える。
 			if selected.Addr == op.target {
 				targetPlacedPosition = position
@@ -1042,6 +1085,7 @@ func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosi
 			swapCandidate = append(swapCandidate, blockList[index])
 		}
 	}
+	swapCandidateCount := len(swapCandidate)
 
 	// swapするslotを最大Z個まで選ぶ。
 	swapSlot := make([]MvpPosition, 0, c.Z)
@@ -1089,6 +1133,7 @@ func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosi
 		// swap後のslotをpath出力へ反映する。
 		populatedPath[slotPosition] = newslot
 	}
+	afterSwapRemaining := len(W)
 
 	// path上に残ったブロックを集め直す。
 	onPathBlock := make([]MvpDataBlock, 0)
@@ -1144,6 +1189,53 @@ func (c *MvpClient) populatePath(W map[int]MvpDataBlock, op OramOP) (map[MvpPosi
 		populatedPathMap = append(populatedPathMap, path)
 	}
 
+	c.logPopulateMetrics(
+		op,
+		wBlockCount,
+		initialCandidateSlots,
+		initialPlaced,
+		len(blockList),
+		swapCandidateCount,
+		len(swapSlot),
+		afterSwapRemaining,
+		len(onPathBlock),
+		populatedPath,
+		populatedStash,
+	)
+
 	// 新しいpath、新しいstash、新しいPathMapを返す。
 	return populatedPath, populatedStash, populatedPathMap
+}
+
+func (c *MvpClient) logPopulateMetrics(op OramOP, wBlocks int, initialCandidateSlots int, initialPlaced int, swapCandidates int, swapSelected int, swapSlots int, afterSwapRemaining int, onPathBeforeReorder int, populatedPath map[MvpPosition]MvpSlot, populatedStash []MvpDataBlock) {
+	if mvpStashMetricsInterval <= 0 || int(c.seq)%mvpStashMetricsInterval != 0 {
+		return
+	}
+
+	pathBlocks := 0
+	for _, slot := range populatedPath {
+		if !slot.IsEmpty() {
+			pathBlocks++
+		}
+	}
+
+	log.Printf(
+		"mvp populate metrics: seq=%d client=%d op=%s addr=%d W_addr=%d W_blocks=%d initial_candidate_slots=%d initial_placed=%d initial_remaining=%d swap_candidates=%d swap_selected=%d swap_slots=%d after_swap_remaining=%d on_path_before_reorder=%d final_path=%d final_stash=%d",
+		c.seq,
+		c.ClientID,
+		op.OP,
+		op.target,
+		wBlocks,
+		wBlocks,
+		initialCandidateSlots,
+		initialPlaced,
+		wBlocks-initialPlaced,
+		swapCandidates,
+		swapSelected,
+		swapSlots,
+		afterSwapRemaining,
+		onPathBeforeReorder,
+		pathBlocks,
+		len(populatedStash),
+	)
 }
