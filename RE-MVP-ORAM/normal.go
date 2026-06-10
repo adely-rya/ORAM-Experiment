@@ -12,7 +12,7 @@ func Normal() {
 		l           = 12
 		n           = 1 << 12
 		seed        = 542
-		clientCount = 50
+		clientCount = 5
 	)
 
 	measuredClientCount := clientCount
@@ -26,6 +26,9 @@ func Normal() {
 	}
 
 	server := NewMvpServer(z, l)
+	if os.Getenv("RE_MVP_SYNC_SERVER") == "1" {
+		server = NewSynchronizedMvpServer(z, l)
+	}
 	positionmap := server.InitializeRandomData(n, seed)
 
 	go server.Run()
