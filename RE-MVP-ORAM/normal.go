@@ -9,8 +9,7 @@ import (
 func Normal() {
 	const (
 		defaultZ    = 4
-		l           = 12
-		n           = 1 << 12
+		defaultL    = 12
 		seed        = 542
 		clientCount = 50
 	)
@@ -21,6 +20,23 @@ func Normal() {
 			z = parsed
 		}
 	}
+	l := defaultL
+	if value := os.Getenv("RE_MVP_L"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			l = parsed
+		}
+	}
+	nExponentOffset := 0
+	if value := os.Getenv("RE_MVP_N_EXP_OFFSET"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			nExponentOffset = parsed
+		}
+	}
+	nExponent := l + nExponentOffset
+	if nExponent < 0 {
+		nExponent = 0
+	}
+	n := 1 << nExponent
 	measuredClientCount := clientCount
 	if value := os.Getenv("RE_MVP_CLIENT_COUNT"); value != "" {
 		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
