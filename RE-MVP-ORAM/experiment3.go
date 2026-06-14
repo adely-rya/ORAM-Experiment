@@ -49,6 +49,7 @@ func NewCientSet(client *MvpClient) *client_set {
 func Experiment3() {
 	clientCounts := experimentClientCounts(minClient, maxClient)
 	accessLoggingEnabled = false
+	ConfigureMvpMaxSignatureFromEnv()
 	defer func() {
 		accessLoggingEnabled = true
 	}()
@@ -255,7 +256,7 @@ func getPSOnly(c *client_set, op OramOP, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	client := c.client
-	_, accessEntry, ok := client.choosePositionMapEntry(op.target)
+	_, accessEntry, ok := client.choosePositionMapEntry(op.target, op.OP)
 	if !ok {
 		log.Printf("missing position map entry for addr %d", op.target)
 		return

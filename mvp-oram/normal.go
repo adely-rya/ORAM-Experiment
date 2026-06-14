@@ -9,9 +9,9 @@ import (
 func Normal() {
 	const seed = 542
 	z := 4
-	l := 8
-	n := 256
-	clientCount := 10
+	l := 15
+	n := 1 << 14
+	clientCount := 50
 
 	if value := os.Getenv("MVP_L"); value != "" {
 		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
