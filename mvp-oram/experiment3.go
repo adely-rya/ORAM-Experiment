@@ -13,17 +13,17 @@ import (
 )
 
 const (
-	z          = 4
+	z          = 5
 	l          = 12
 	n          = 1 << 12
 	seed       = 542
-	WarmUp     = 200
+	WarmUp     = 20
 	MonteCarlo = 20000
-	minClient  = 1
+	minClient  = 20
 	maxClient  = 20
 )
 
-var experimentAlphas = []float32{0.9, 1.5}
+var experimentAlphas = []float32{1.0}
 var zipfGeneratorRand = rand.New(rand.NewSource(time.Now().UnixNano()))
 var zipfGeneratorMu sync.Mutex
 

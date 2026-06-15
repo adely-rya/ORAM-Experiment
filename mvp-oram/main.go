@@ -21,6 +21,9 @@ func main() {
 	case "experiment4":
 		log.Println("experiment4 running...")
 		Experiment4()
+	case "h-pattern":
+		log.Println("h-pattern running...")
+		HPatternDistribution()
 	default:
 		panic("Not setting experiment")
 	}

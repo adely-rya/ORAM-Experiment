@@ -8,16 +8,13 @@ import (
 )
 
 func main() {
-	f := flag.String("experiment", "normal", "experiment pattern")
+	f := flag.String("experiment", "random", "experiment pattern")
 	flag.Parse()
 
 	switch *f {
-	case "normal":
-		log.Println("normal running...")
-		Normal()
-	case "experiment3":
-		log.Println("experiment3 running...")
-		Experiment3()
+	case "random":
+		log.Println("random access running...")
+		RandomAccess()
 	default:
 		panic("Not setting experiment")
 	}
