@@ -1093,7 +1093,7 @@ func (c *MvpClient) buildPatternPlacementState(blocksByAddr map[int][]MvpDataBlo
 	return addrkey, evaluationResult, addrVSemptysig
 }
 
-func (c *MvpClient) placePatternBlocks(
+func (c *MvpClient) oldplacePatternBlocks(
 	blocksByAddr map[int][]MvpDataBlock,
 	unusedSlot []MvpPosition,
 	populatedPath map[MvpPosition]MvpSlot,
@@ -1104,13 +1104,7 @@ func (c *MvpClient) placePatternBlocks(
 		return unusedSlot, 0
 	}
 
-	// 同じアドレスの配置候補を新しい順に整列し、先頭から空き slot へ置けるようにする。
-	for addr := range blocksByAddr {
-		if len(blocksByAddr[addr]) > 1 {
-			blocksByAddr[addr] = sort_block(blocksByAddr[addr])
-		}
-	}
-
+	//addrkeyは評価のキーのリスト
 	addrkey, evaluationResult, addrVSemptysig := c.buildPatternPlacementState(blocksByAddr, *populatedPathMap)
 	if len(addrkey) == 0 {
 		return unusedSlot, 0
@@ -1126,7 +1120,7 @@ func (c *MvpClient) placePatternBlocks(
 			remainingUnused = append(remainingUnused, unusedSlot[unusedIndex:]...)
 			break
 		}
-		if index == len(addrkey) {
+		if index == len(addrkey) { //必ず一周回ったらソートする。
 			sort.Slice(addrkey, func(i, j int) bool {
 				left := evaluationResult[addrkey[i]]
 				right := evaluationResult[addrkey[j]]
@@ -1147,13 +1141,30 @@ func (c *MvpClient) placePatternBlocks(
 		// 評価値の小さいアドレスから順に、再利用できる signature slot を持つアドレスを探す。
 		for attempts := 0; attempts < len(addrkey); attempts++ {
 			addr = addrkey[index]
-			if len(blocksByAddr[addr]) == 0 {
-				index++
-				if index == len(addrkey) {
-					index = 0
+
+			if move == "priority_place" || move == "drain_place" {
+				if len(blocksByAddr[addr]) == 0 { //置き換え可能なブロックが存在するのか？
+					index++
+					if index == len(addrkey) {
+						index = 0
+					}
+					continue
 				}
-				continue
+
+				block := blocksByAddr[addr][0]
+				blocksByAddr[addr] = blocksByAddr[addr][1:]
+				block.Version.SetS(c.seq)
+				slot := NewMvpSlot(c.seq)
+				slot.SetBlock(block)
+				populatedPath[position] = slot
+				update := newPath(block.Addr, block.signature, position, positionMapVersion(block.Version, c.seq), c.seq)
+				appendPositionMapUpdate(populatedPathMap, update)
+			} else {
+				if len(addrVSemptysig[addr]) > 0 {
+					signature = addrVSemptysig[addr][0]
+				}
 			}
+
 			if len(addrVSemptysig[addr]) > 0 {
 				signature = addrVSemptysig[addr][0]
 				addrVSemptysig[addr] = addrVSemptysig[addr][1:]
@@ -1294,7 +1305,7 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 		addrlist = append(addrlist, addr)
 		// 同一アドレスの全ブロックを確認し、signature が 0 なら本体、非 0 ならコピーとして扱う。
 		for _, block := range blocks {
-			if block.signature == 0 {
+			if block.signature == 0 || block == targetBlock {
 				prioritylist = append(prioritylist, block)
 				continue
 			}

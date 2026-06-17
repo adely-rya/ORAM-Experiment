@@ -28,6 +28,17 @@ func TestIdealStatisticalDistanceRandomKDistributionTwoClients(t *testing.T) {
 	}
 }
 
+func TestIdealStatisticalDistanceRandomKDistributionThreeClientsTwoLeaves(t *testing.T) {
+	distribution := idealStatisticalDistanceRandomKDistribution(1, 3)
+
+	if math.Abs(distribution[1]-0.25) > 1e-12 {
+		t.Fatalf("distribution[1] = %.15f, want 0.25", distribution[1])
+	}
+	if math.Abs(distribution[2]-0.75) > 1e-12 {
+		t.Fatalf("distribution[2] = %.15f, want 0.75", distribution[2])
+	}
+}
+
 func TestIdealStatisticalDistanceRandomKDistributionSumsToOne(t *testing.T) {
 	distribution := idealStatisticalDistanceRandomKDistribution(8, 20)
 	sum := 0.0
@@ -36,6 +47,12 @@ func TestIdealStatisticalDistanceRandomKDistributionSumsToOne(t *testing.T) {
 	}
 	if math.Abs(sum-1) > 1e-12 {
 		t.Fatalf("sum = %.15f, want 1", sum)
+	}
+}
+
+func TestNormalizeStatisticalDistanceAccessTypeKeepsZipf(t *testing.T) {
+	if got := normalizeStatisticalDistanceAccessType("zipf"); got != "zipf" {
+		t.Fatalf("normalizeStatisticalDistanceAccessType(\"zipf\") = %q, want zipf", got)
 	}
 }
 

@@ -31,8 +31,8 @@ func RunExperiment(runMode string, experimentMode string, accessType string, ora
 		defaultL                     = 12
 		seed                         = 542
 		clientCount                  = 50
-		readRatio                    = 0.9
-		zipfAlpha                    = 1.5
+		readRatio                    = 0.8
+		zipfAlpha                    = 1.1
 		stashMetricsSequenceInterval = Version(100)
 	)
 

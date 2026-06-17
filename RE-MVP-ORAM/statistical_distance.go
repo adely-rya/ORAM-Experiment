@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -38,6 +39,7 @@ type statisticalDistanceResult struct {
 	distance      float64
 	elapsed       time.Duration
 	observedTotal int
+	accessStats   statisticalDistanceAccessStats
 }
 
 type statisticalDistanceLeafInterval struct {
@@ -45,6 +47,21 @@ type statisticalDistanceLeafInterval struct {
 	end   int
 }
 
+type statisticalDistanceAccessStats struct {
+	samples           int
+	readSamples       int
+	writeSamples      int
+	activeSigTotal    int
+	candidateLeafSum  int
+	candidateLeafMin  int
+	candidateLeafMax  int
+	zeroCandidateOps  int
+	fullLeafCandidate int
+	candidateByK      map[int]int
+	activeSigByCount  map[int]int
+}
+
+// RunStatisticalDistanceExperiment は統計的距離実験の設定を読み込み、対象 ORAM の実験を実行して CSV に保存する。
 func RunStatisticalDistanceExperiment(oramType string, accessType string) {
 	config := readStatisticalDistanceConfig(oramType, accessType)
 	log.Printf(
@@ -96,17 +113,19 @@ func RunStatisticalDistanceExperiment(oramType string, accessType string) {
 		result.config.csvPath,
 		result.elapsed.Round(time.Millisecond),
 	)
+	logStatisticalDistanceAccessStats(result.config.oramType, result.config.l, result.accessStats)
 }
 
+// readStatisticalDistanceConfig は環境変数から統計的距離実験のパラメータを読み込む。
 func readStatisticalDistanceConfig(oramType string, accessType string) statisticalDistanceConfig {
 	const (
 		defaultZ            = 4
 		defaultL            = 10
-		defaultClientCount  = 50
-		defaultWarmupRounds = 50
-		defaultTrials       = 20000
+		defaultClientCount  = 40
+		defaultWarmupRounds = 300
+		defaultTrials       = 200000
 		defaultSeed         = 542
-		defaultReadRatio    = 0.1
+		defaultReadRatio    = 0.5
 		defaultZipfAlpha    = 1.1
 	)
 
@@ -127,6 +146,7 @@ func readStatisticalDistanceConfig(oramType string, accessType string) statistic
 	}
 }
 
+// runReMvpStatisticalDistance は RE-MVP-ORAM でウォームアップ後、ランダムリーフ選択モデルの K 分布を測定する。
 func runReMvpStatisticalDistance(config statisticalDistanceConfig) (statisticalDistanceResult, error) {
 	startedAt := time.Now()
 	server := NewMvpServer(config.z, config.l)
@@ -150,7 +170,10 @@ func runReMvpStatisticalDistance(config statisticalDistanceConfig) (statisticalD
 	}
 
 	leafRNG := rand.New(rand.NewSource(config.seed + 9001))
-	observed := measureReMvpStatisticalDistance(clients, config.trials, leafRNG)
+	observed, accessStats, err := measureReMvpStatisticalDistance(clients, config.trials, leafRNG)
+	if err != nil {
+		return statisticalDistanceResult{}, err
+	}
 	ideal := idealStatisticalDistanceRandomKDistribution(config.l, config.clientCount)
 	distance := statisticalDistanceObservedToIdeal(observed, ideal)
 
@@ -161,6 +184,7 @@ func runReMvpStatisticalDistance(config statisticalDistanceConfig) (statisticalD
 		distance:      distance,
 		elapsed:       time.Since(startedAt),
 		observedTotal: config.trials,
+		accessStats:   accessStats,
 	}, nil
 }
 
@@ -169,6 +193,7 @@ type statisticalDistanceReMvpClient struct {
 	operation AccessOperation
 }
 
+// runReMvpStatisticalDistanceWarmup は RE-MVP-ORAM の状態を事前に動かすため、全クライアントに指定回数アクセスさせる。
 func runReMvpStatisticalDistanceWarmup(clients []*statisticalDistanceReMvpClient, rounds int) error {
 	previousLogOutput := log.Writer()
 	log.SetOutput(io.Discard)
@@ -195,6 +220,7 @@ func runReMvpStatisticalDistanceWarmup(clients []*statisticalDistanceReMvpClient
 	return nil
 }
 
+// syncReMvpStatisticalDistancePositionMaps はウォームアップ後の path map を各 RE-MVP-ORAM クライアントに反映する。
 func syncReMvpStatisticalDistancePositionMaps(clients []*statisticalDistanceReMvpClient) error {
 	errs := make(chan error, len(clients))
 	for _, state := range clients {
@@ -217,24 +243,78 @@ func syncReMvpStatisticalDistancePositionMaps(clients []*statisticalDistanceReMv
 	return nil
 }
 
-func measureReMvpStatisticalDistance(clients []*statisticalDistanceReMvpClient, trials int, leafRNG *rand.Rand) []int {
+type statisticalDistanceReMvpPreparedAccess struct {
+	client    *MvpClient
+	operation OramOP
+	signature int
+	leaf      MvpPosition
+}
+
+// measureReMvpStatisticalDistance は設定されたアクセス列で RE-MVP-ORAM を実際に動かし、各試行の異なるリーフ数 K を数える。
+func measureReMvpStatisticalDistance(clients []*statisticalDistanceReMvpClient, trials int, leafRNG *rand.Rand) ([]int, statisticalDistanceAccessStats, error) {
 	counts := make([]int, len(clients)+1)
+	stats := newStatisticalDistanceAccessStats()
 	for trial := 0; trial < trials; trial++ {
 		seen := make(map[MvpBucketPosition]struct{}, len(clients))
+		prepared := make([]statisticalDistanceReMvpPreparedAccess, 0, len(clients))
 		for _, state := range clients {
 			op := state.operation.Next()
-			_, leaf, ok := chooseReMvpStatisticalDistanceTargetLeaf(state.client, op.target, op.OP, leafRNG)
+			version, pathMaps, err := state.client.GetPM()
+			if err != nil {
+				return nil, statisticalDistanceAccessStats{}, fmt.Errorf("trial %d client %d getpm: %w", trial, state.client.ClientID, err)
+			}
+			state.client.seq = version
+			state.client.consolidatePathMaps(pathMaps)
+
+			signature, leaf, ok := chooseReMvpStatisticalDistanceTargetLeaf(state.client, op.target, op.OP, leafRNG)
+			recordReMvpStatisticalDistanceAccessStats(&stats, state.client, op)
 			if !ok {
 				continue
 			}
 			seen[leaf.bucket] = struct{}{}
+			prepared = append(prepared, statisticalDistanceReMvpPreparedAccess{
+				client:    state.client,
+				operation: op,
+				signature: signature,
+				leaf:      leaf,
+			})
 		}
 		counts[len(seen)]++
+		if err := runPreparedReMvpStatisticalDistanceAccesses(prepared); err != nil {
+			return nil, statisticalDistanceAccessStats{}, fmt.Errorf("trial %d: %w", trial, err)
+		}
 		logStatisticalDistanceTrialProgress(trial+1, trials)
 	}
-	return counts
+	return counts, stats, nil
 }
 
+// runPreparedReMvpStatisticalDistanceAccesses は測定済みのリーフを使って RE-MVP-ORAM のアクセスを実行し、状態を進める。
+func runPreparedReMvpStatisticalDistanceAccesses(accesses []statisticalDistanceReMvpPreparedAccess) error {
+	errs := make(chan error, len(accesses))
+	for _, access := range accesses {
+		go func(access statisticalDistanceReMvpPreparedAccess) {
+			path, stash, err := access.client.GetPS(access.leaf)
+			if err != nil {
+				errs <- err
+				return
+			}
+			access.client.path = path
+			access.client.Stash = stash
+
+			workingSet := access.client.mergePathStashes()
+			populatedPath, populatedStash, populatedPathMap := access.client.populatePath(workingSet, access.operation, access.signature)
+			errs <- access.client.Evict(populatedPath, populatedPathMap, populatedStash)
+		}(access)
+	}
+	for range accesses {
+		if err := <-errs; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// chooseReMvpStatisticalDistanceTargetLeaf は RE-MVP-ORAM の position map から指定アドレスが載り得るリーフを選ぶ。
 func chooseReMvpStatisticalDistanceTargetLeaf(client *MvpClient, addr int, op string, rng *rand.Rand) (int, MvpPosition, bool) {
 	entries, ok := client.PositionMap[addr]
 	if !ok || len(entries) == 0 {
@@ -277,6 +357,38 @@ func chooseReMvpStatisticalDistanceTargetLeaf(client *MvpClient, addr int, op st
 	return 0, statisticalDistanceSampleLeafFromIntervals(merged, client.L, rng), true
 }
 
+// recordReMvpStatisticalDistanceAccessStats は RE-MVP-ORAM の現在の position map から active sig 数と候補 leaf 数を集計する。
+func recordReMvpStatisticalDistanceAccessStats(stats *statisticalDistanceAccessStats, client *MvpClient, op OramOP) {
+	entries, ok := client.PositionMap[op.target]
+	if !ok || len(entries) == 0 {
+		stats.record(op.OP, 0, 0, client.L)
+		return
+	}
+
+	activeSigCount := 0
+	intervals := make([]statisticalDistanceLeafInterval, 0, len(entries))
+	if op.OP == Write {
+		entry, ok := entries[0]
+		if !ok || entry.Slot == mvpDeletePosition {
+			stats.record(op.OP, 0, 0, client.L)
+			return
+		}
+		activeSigCount = 1
+		intervals = append(intervals, statisticalDistancePositionInterval(entry.Slot, client.L))
+	} else {
+		for _, entry := range entries {
+			if entry.Slot == mvpDeletePosition {
+				continue
+			}
+			activeSigCount++
+			intervals = append(intervals, statisticalDistancePositionInterval(entry.Slot, client.L))
+		}
+	}
+
+	stats.record(op.OP, activeSigCount, statisticalDistanceIntervalLeafCount(mergeStatisticalDistanceLeafIntervals(intervals)), client.L)
+}
+
+// chooseReMvpStatisticalDistanceLeafFromPosition は RE-MVP-ORAM の位置をリーフまでランダムに補完する。
 func chooseReMvpStatisticalDistanceLeafFromPosition(position MvpPosition, pathLen int, rng *rand.Rand) MvpPosition {
 	bucketPosition := position.bucket
 	if position == mvpStashPosition || bucketPosition == mvpStashBucketPosition || bucketPosition == mvpRootBucketPosition {
@@ -296,6 +408,7 @@ func chooseReMvpStatisticalDistanceLeafFromPosition(position MvpPosition, pathLe
 	return MvpPosition{bucket: MvpBucketPosition(leaf)}
 }
 
+// runBaseMvpStatisticalDistance は通常の MVP-ORAM でウォームアップ後、ランダムリーフ選択モデルの K 分布を測定する。
 func runBaseMvpStatisticalDistance(config statisticalDistanceConfig) (statisticalDistanceResult, error) {
 	startedAt := time.Now()
 	server := NewBaseMvpServer(config.z, config.l)
@@ -319,7 +432,10 @@ func runBaseMvpStatisticalDistance(config statisticalDistanceConfig) (statistica
 	}
 
 	leafRNG := rand.New(rand.NewSource(config.seed + 9001))
-	observed := measureBaseMvpStatisticalDistance(clients, config.trials, leafRNG)
+	observed, accessStats, err := measureBaseMvpStatisticalDistance(clients, config.trials, leafRNG)
+	if err != nil {
+		return statisticalDistanceResult{}, err
+	}
 	ideal := idealStatisticalDistanceRandomKDistribution(config.l, config.clientCount)
 	distance := statisticalDistanceObservedToIdeal(observed, ideal)
 
@@ -330,6 +446,7 @@ func runBaseMvpStatisticalDistance(config statisticalDistanceConfig) (statistica
 		distance:      distance,
 		elapsed:       time.Since(startedAt),
 		observedTotal: config.trials,
+		accessStats:   accessStats,
 	}, nil
 }
 
@@ -338,6 +455,7 @@ type statisticalDistanceBaseMvpClient struct {
 	operation AccessOperation
 }
 
+// runBaseMvpStatisticalDistanceWarmup は通常の MVP-ORAM の状態を事前に動かすため、全クライアントに指定回数アクセスさせる。
 func runBaseMvpStatisticalDistanceWarmup(clients []*statisticalDistanceBaseMvpClient, rounds int) error {
 	previousLogOutput := log.Writer()
 	log.SetOutput(io.Discard)
@@ -364,6 +482,7 @@ func runBaseMvpStatisticalDistanceWarmup(clients []*statisticalDistanceBaseMvpCl
 	return nil
 }
 
+// syncBaseMvpStatisticalDistancePositionMaps はウォームアップ後の path map を各 MVP-ORAM クライアントに反映する。
 func syncBaseMvpStatisticalDistancePositionMaps(clients []*statisticalDistanceBaseMvpClient) error {
 	errs := make(chan error, len(clients))
 	for _, state := range clients {
@@ -386,25 +505,90 @@ func syncBaseMvpStatisticalDistancePositionMaps(clients []*statisticalDistanceBa
 	return nil
 }
 
-func measureBaseMvpStatisticalDistance(clients []*statisticalDistanceBaseMvpClient, trials int, leafRNG *rand.Rand) []int {
+type statisticalDistanceBaseMvpPreparedAccess struct {
+	client    *BaseMvpClient
+	operation OramOP
+	leaf      BaseMvpPosition
+}
+
+// measureBaseMvpStatisticalDistance は設定されたアクセス列で通常の MVP-ORAM を実際に動かし、各試行の異なるリーフ数 K を数える。
+func measureBaseMvpStatisticalDistance(clients []*statisticalDistanceBaseMvpClient, trials int, leafRNG *rand.Rand) ([]int, statisticalDistanceAccessStats, error) {
 	counts := make([]int, len(clients)+1)
+	stats := newStatisticalDistanceAccessStats()
 	for trial := 0; trial < trials; trial++ {
 		seen := make(map[BaseMvpBucketPosition]struct{}, len(clients))
+		prepared := make([]statisticalDistanceBaseMvpPreparedAccess, 0, len(clients))
 		for _, state := range clients {
 			op := state.operation.Next()
+			version, pathMaps, err := state.client.GetPM()
+			if err != nil {
+				return nil, statisticalDistanceAccessStats{}, fmt.Errorf("trial %d client %d getpm: %w", trial, state.client.ClientID, err)
+			}
+			state.client.seq = version
+			state.client.consolidatePathMaps(pathMaps)
+
 			entry, ok := state.client.PositionMap[op.target]
 			if !ok {
 				continue
 			}
+			recordBaseMvpStatisticalDistanceAccessStats(&stats, state.client, op, entry)
 			leaf := chooseBaseMvpStatisticalDistanceLeafFromPosition(entry.Slot, state.client.L, leafRNG)
 			seen[leaf.bucket] = struct{}{}
+			prepared = append(prepared, statisticalDistanceBaseMvpPreparedAccess{
+				client:    state.client,
+				operation: op,
+				leaf:      leaf,
+			})
 		}
 		counts[len(seen)]++
+		if err := runPreparedBaseMvpStatisticalDistanceAccesses(prepared); err != nil {
+			return nil, statisticalDistanceAccessStats{}, fmt.Errorf("trial %d: %w", trial, err)
+		}
 		logStatisticalDistanceTrialProgress(trial+1, trials)
 	}
-	return counts
+	return counts, stats, nil
 }
 
+// runPreparedBaseMvpStatisticalDistanceAccesses は測定済みのリーフを使って通常の MVP-ORAM のアクセスを実行し、状態を進める。
+func runPreparedBaseMvpStatisticalDistanceAccesses(accesses []statisticalDistanceBaseMvpPreparedAccess) error {
+	errs := make(chan error, len(accesses))
+	for _, access := range accesses {
+		go func(access statisticalDistanceBaseMvpPreparedAccess) {
+			basePath, stash, err := access.client.GetPS(access.leaf)
+			if err != nil {
+				errs <- err
+				return
+			}
+			access.client.basePath = basePath
+			access.client.Stash = stash
+
+			workingSet := access.client.mergePathStashes()
+			targetBlock, ok := workingSet[access.operation.target]
+			if !ok {
+				errs <- fmt.Errorf("not target block in working set")
+				return
+			}
+			if access.operation.OP == Write {
+				targetBlock.Data = access.operation.param
+				targetBlock.Version = Versions{access.client.seq, access.client.seq, access.client.seq}
+			} else {
+				targetBlock.Version.SetA(access.client.seq)
+			}
+			workingSet[access.operation.target] = targetBlock
+
+			populatedPath, populatedStash, populatedPathMap := access.client.populatePath(workingSet, access.operation)
+			errs <- access.client.Evict(populatedPath, populatedPathMap, populatedStash)
+		}(access)
+	}
+	for range accesses {
+		if err := <-errs; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// logStatisticalDistanceTrialProgress は統計的距離実験の試行進捗を一定間隔で表示する。
 func logStatisticalDistanceTrialProgress(done int, total int) {
 	if done%100 != 0 && done != total {
 		return
@@ -412,6 +596,86 @@ func logStatisticalDistanceTrialProgress(done int, total int) {
 	fmt.Printf("statisticaldistance trial progress: %d/%d\n", done, total)
 }
 
+func newStatisticalDistanceAccessStats() statisticalDistanceAccessStats {
+	return statisticalDistanceAccessStats{
+		candidateLeafMin: 1 << 30,
+		candidateByK:     make(map[int]int),
+		activeSigByCount: make(map[int]int),
+	}
+}
+
+func (s *statisticalDistanceAccessStats) record(op string, activeSigCount int, candidateLeafCount int, pathLen int) {
+	s.samples++
+	if op == Read {
+		s.readSamples++
+	} else if op == Write {
+		s.writeSamples++
+	}
+	s.activeSigTotal += activeSigCount
+	s.candidateLeafSum += candidateLeafCount
+	if candidateLeafCount < s.candidateLeafMin {
+		s.candidateLeafMin = candidateLeafCount
+	}
+	if candidateLeafCount > s.candidateLeafMax {
+		s.candidateLeafMax = candidateLeafCount
+	}
+	if candidateLeafCount == 0 {
+		s.zeroCandidateOps++
+	}
+	if candidateLeafCount == 1<<pathLen {
+		s.fullLeafCandidate++
+	}
+	s.candidateByK[candidateLeafCount]++
+	s.activeSigByCount[activeSigCount]++
+}
+
+// recordBaseMvpStatisticalDistanceAccessStats は通常の MVP-ORAM の現在位置から候補 leaf 数を集計する。
+func recordBaseMvpStatisticalDistanceAccessStats(stats *statisticalDistanceAccessStats, client *BaseMvpClient, op OramOP, entry BaseMvpPositionMapEntry) {
+	stats.record(op.OP, 1, statisticalDistanceBasePositionLeafCount(entry.Slot, client.L), client.L)
+}
+
+// logStatisticalDistanceAccessStats は実測アクセスでクライアントから見えた候補数の要約を出力する。
+func logStatisticalDistanceAccessStats(oramType string, pathLen int, stats statisticalDistanceAccessStats) {
+	if stats.samples == 0 {
+		log.Printf("statisticaldistance access stats: oram=%s samples=0", oramType)
+		return
+	}
+
+	log.Printf(
+		"statisticaldistance access stats: oram=%s samples=%d reads=%d writes=%d avg_active_sig=%.4f avg_candidate_leaves=%.4f min_candidate_leaves=%d max_candidate_leaves=%d full_leaf_candidates=%d zero_candidates=%d leaf_count=%d",
+		oramType,
+		stats.samples,
+		stats.readSamples,
+		stats.writeSamples,
+		float64(stats.activeSigTotal)/float64(stats.samples),
+		float64(stats.candidateLeafSum)/float64(stats.samples),
+		stats.candidateLeafMin,
+		stats.candidateLeafMax,
+		stats.fullLeafCandidate,
+		stats.zeroCandidateOps,
+		1<<pathLen,
+	)
+	log.Printf("statisticaldistance access stats buckets: oram=%s candidate_leaf_counts=%s active_sig_counts=%s", oramType, formatStatisticalDistanceIntHistogram(stats.candidateByK), formatStatisticalDistanceIntHistogram(stats.activeSigByCount))
+}
+
+func formatStatisticalDistanceIntHistogram(histogram map[int]int) string {
+	if len(histogram) == 0 {
+		return "{}"
+	}
+	keys := make([]int, 0, len(histogram))
+	for key := range histogram {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%d:%d", key, histogram[key]))
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// chooseBaseMvpStatisticalDistanceLeafFromPosition は通常の MVP-ORAM の位置をリーフまでランダムに補完する。
 func chooseBaseMvpStatisticalDistanceLeafFromPosition(position BaseMvpPosition, pathLen int, rng *rand.Rand) BaseMvpPosition {
 	bucketPosition := position.bucket
 	if position == baseMvpStashPosition || bucketPosition == baseMvpStashBucketPosition || bucketPosition == baseMvpRootBucketPosition {
@@ -431,6 +695,33 @@ func chooseBaseMvpStatisticalDistanceLeafFromPosition(position BaseMvpPosition, 
 	return BaseMvpPosition{bucket: BaseMvpBucketPosition(leaf)}
 }
 
+func statisticalDistancePositionInterval(position MvpPosition, pathLen int) statisticalDistanceLeafInterval {
+	bucketPosition := position.bucket
+	if position == mvpStashPosition || bucketPosition == mvpStashBucketPosition || bucketPosition == mvpRootBucketPosition {
+		bucketPosition = ""
+	}
+
+	prefix := bucketPosition.String()
+	if len(prefix) > pathLen {
+		prefix = ""
+	}
+	return statisticalDistancePrefixInterval(prefix, pathLen)
+}
+
+func statisticalDistanceBasePositionLeafCount(position BaseMvpPosition, pathLen int) int {
+	bucketPosition := position.bucket
+	if position == baseMvpStashPosition || bucketPosition == baseMvpStashBucketPosition || bucketPosition == baseMvpRootBucketPosition {
+		bucketPosition = ""
+	}
+
+	prefix := bucketPosition.String()
+	if len(prefix) > pathLen {
+		prefix = ""
+	}
+	return 1 << (pathLen - len(prefix))
+}
+
+// statisticalDistancePrefixInterval はリーフ接頭辞が表す整数区間 [start, end) を返す。
 func statisticalDistancePrefixInterval(prefix string, pathLen int) statisticalDistanceLeafInterval {
 	start := 0
 	if prefix != "" {
@@ -444,6 +735,7 @@ func statisticalDistancePrefixInterval(prefix string, pathLen int) statisticalDi
 	return statisticalDistanceLeafInterval{start: start, end: start + width}
 }
 
+// mergeStatisticalDistanceLeafIntervals は重なったリーフ区間を併合して重複のない区間列にする。
 func mergeStatisticalDistanceLeafIntervals(intervals []statisticalDistanceLeafInterval) []statisticalDistanceLeafInterval {
 	if len(intervals) == 0 {
 		return nil
@@ -471,6 +763,15 @@ func mergeStatisticalDistanceLeafIntervals(intervals []statisticalDistanceLeafIn
 	return merged
 }
 
+func statisticalDistanceIntervalLeafCount(intervals []statisticalDistanceLeafInterval) int {
+	total := 0
+	for _, interval := range intervals {
+		total += interval.end - interval.start
+	}
+	return total
+}
+
+// statisticalDistanceSampleLeafFromIntervals は複数のリーフ区間の和集合から一様ランダムに 1 つのリーフを選ぶ。
 func statisticalDistanceSampleLeafFromIntervals(intervals []statisticalDistanceLeafInterval, pathLen int, rng *rand.Rand) MvpPosition {
 	total := 0
 	for _, interval := range intervals {
@@ -494,6 +795,7 @@ func statisticalDistanceSampleLeafFromIntervals(intervals []statisticalDistanceL
 	return MvpPosition{bucket: MvpBucketPosition(leaf)}
 }
 
+// newStatisticalDistanceOperation は実測値を取るため、設定された random または Zipf のアクセス生成器を作る。
 func newStatisticalDistanceOperation(config statisticalDistanceConfig, seed int64) AccessOperation {
 	switch config.accessType {
 	case "random":
@@ -505,6 +807,7 @@ func newStatisticalDistanceOperation(config statisticalDistanceConfig, seed int6
 	}
 }
 
+// idealStatisticalDistanceRandomKDistribution は clientCount 回だけ独立に一様ランダムなリーフを選んだときの K 分布を計算する。
 func idealStatisticalDistanceRandomKDistribution(pathLen int, clientCount int) []float64 {
 	leafCountInt := 1 << pathLen
 	leafCount := float64(leafCountInt)
@@ -528,6 +831,7 @@ func idealStatisticalDistanceRandomKDistribution(pathLen int, clientCount int) [
 	return distribution
 }
 
+// statisticalDistanceObservedToIdeal は観測分布と理論分布の全変動距離を計算する。
 func statisticalDistanceObservedToIdeal(observed []int, ideal []float64) float64 {
 	total := 0
 	for _, count := range observed {
@@ -552,6 +856,7 @@ func statisticalDistanceObservedToIdeal(observed []int, ideal []float64) float64
 	return sum / 2
 }
 
+// writeStatisticalDistanceCSV は統計的距離実験の観測値、理論値、差分を CSV に出力する。
 func writeStatisticalDistanceCSV(result statisticalDistanceResult) error {
 	if err := os.MkdirAll(filepath.Dir(result.config.csvPath), 0755); err != nil {
 		return err
@@ -624,6 +929,7 @@ func writeStatisticalDistanceCSV(result statisticalDistanceResult) error {
 	return file.Sync()
 }
 
+// normalizeStatisticalDistanceAccessType は統計的距離実験で使う実測側アクセス種別を正規化する。
 func normalizeStatisticalDistanceAccessType(accessType string) string {
 	switch accessType {
 	case "random", "zipf":
@@ -633,6 +939,7 @@ func normalizeStatisticalDistanceAccessType(accessType string) string {
 	}
 }
 
+// readStatisticalDistancePositiveIntEnv は正の整数の環境変数を読み、無効なら fallback を返す。
 func readStatisticalDistancePositiveIntEnv(name string, fallback int) int {
 	value := os.Getenv(name)
 	if value == "" {
@@ -646,6 +953,7 @@ func readStatisticalDistancePositiveIntEnv(name string, fallback int) int {
 	return parsed
 }
 
+// readStatisticalDistanceFloatEnv は浮動小数点数の環境変数を読み、無効なら fallback を返す。
 func readStatisticalDistanceFloatEnv(name string, fallback float64) float64 {
 	value := os.Getenv(name)
 	if value == "" {
@@ -659,6 +967,7 @@ func readStatisticalDistanceFloatEnv(name string, fallback float64) float64 {
 	return parsed
 }
 
+// readStatisticalDistanceStringEnv は文字列の環境変数を読み、未設定なら fallback を返す。
 func readStatisticalDistanceStringEnv(name string, fallback string) string {
 	value := os.Getenv(name)
 	if value == "" {
