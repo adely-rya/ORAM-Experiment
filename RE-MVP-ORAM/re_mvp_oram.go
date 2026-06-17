@@ -19,10 +19,9 @@ const (
 	mvpStashSlotPosition   MvpSlotPosition   = -1
 	mvpInitialVersion      Version           = 0
 
-	mvpDefaultMaxSignature                = 5
+	mvpDefaultMaxSignature                = 10
 	mvpDefaultPathMapCompactInterval      = 10000
 	mvpDefaultPathMapCompactProtectedTail = 2000
-	mvpStashMetricsInterval               = 10
 	mvpDefaultSwapLimit                   = 8
 )
 
@@ -343,6 +342,18 @@ type EvictResponse struct {
 	Err error
 }
 
+type GetStashMetricsRequest struct {
+	Reply chan GetStashMetricsResponse
+}
+
+type GetStashMetricsResponse struct {
+	Seq                 Version
+	StashVersions       int
+	StashTotal          int
+	StashMaxVersionSize int
+	Err                 error
+}
+
 type OramState struct {
 	TreeState  MvpTree
 	StashState map[int][]MvpDataBlock
@@ -628,12 +639,11 @@ func (r EvictReques) handle(s *MvpServer) {
 	for position, newslot := range r.Path {
 		slots := nowtree[position.bucket].Slots[position.slot]
 		oldslots := oldtree[position.bucket].Slots[position.slot]
-		for version, oldslot := range oldslots {
+		for version := range oldslots {
 			_, ok := slots[version]
 			if ok {
 				delete(slots, version) //読み取り時点で存在していたスロットは消す
 			}
-			_ = oldslot
 		}
 		slots[newslot.Version] = newslot
 	}
@@ -646,7 +656,6 @@ func (r EvictReques) handle(s *MvpServer) {
 	}
 
 	s.Stashs[int(r.Seq)] = r.Stash
-	s.logStashMetrics(r) //スタッシュの状態を監視する
 
 	for _, path := range r.PathMap {
 		s.PathMaps = append(s.PathMaps, path)
@@ -662,18 +671,7 @@ func (r EvictReques) handle(s *MvpServer) {
 	}
 }
 
-func (s *MvpServer) logStashMetrics(r EvictReques) {
-	if !shouldLogMetrics(r.Seq) {
-		return
-	}
-
-	pathBlocks := 0
-	for _, slot := range r.Path {
-		if !slot.IsEmpty() {
-			pathBlocks++
-		}
-	}
-
+func (r GetStashMetricsRequest) handle(s *MvpServer) {
 	totalStashBlocks := 0
 	maxStashVersionBlocks := 0
 	for _, stash := range s.Stashs {
@@ -683,17 +681,13 @@ func (s *MvpServer) logStashMetrics(r EvictReques) {
 		}
 	}
 
-	log.Printf(
-		"stash metrics: seq=%d client=%d path_out=%d stash_out=%d stash_versions=%d stash_total=%d stash_max_version=%d pathmap_updates=%d",
-		r.Seq,
-		r.ClientID,
-		pathBlocks,
-		len(r.Stash),
-		len(s.Stashs),
-		totalStashBlocks,
-		maxStashVersionBlocks,
-		len(r.PathMap),
-	)
+	r.Reply <- GetStashMetricsResponse{
+		Seq:                 s.counter,
+		StashVersions:       len(s.Stashs),
+		StashTotal:          totalStashBlocks,
+		StashMaxVersionSize: maxStashVersionBlocks,
+		Err:                 nil,
+	}
 }
 
 type MvpClient struct {
@@ -709,8 +703,6 @@ type MvpClient struct {
 
 	seq Version
 }
-
-var accessLoggingEnabled = true //クライアントのアクセスログの表示切替
 
 func NewMvpClient(l int, z int, clientID int, positionmap map[int]map[int]MvpPositionMapEntry, server chan<- ServerRequest) *MvpClient {
 	return &MvpClient{
@@ -989,29 +981,6 @@ func appendWorkingBlock(W map[int][]MvpDataBlock, block MvpDataBlock) {
 	W[block.Addr] = append(W[block.Addr], block)
 }
 
-// ワーキングセットに対してアドレスとシグネチャを指定して取得
-func getWorkingBlock(W map[int][]MvpDataBlock, addr int, sig int) (MvpDataBlock, bool) {
-	for _, block := range W[addr] {
-		if block.signature == sig {
-			return block, true
-		}
-	}
-	return MvpDataBlock{}, false
-}
-
-func newestWorkingBlock(blocks []MvpDataBlock) (MvpDataBlock, bool) {
-	if len(blocks) == 0 {
-		return MvpDataBlock{}, false
-	}
-	newest := blocks[0]
-	for _, candidate := range blocks[1:] {
-		if newerVersions(candidate.Version, newest.Version) {
-			newest = candidate
-		}
-	}
-	return newest, true
-}
-
 func setWorkingBlock(W map[int][]MvpDataBlock, block MvpDataBlock) {
 	blocks := W[block.Addr]
 	for i := range blocks {
@@ -1194,24 +1163,32 @@ func (c *MvpClient) placePatternBlocks(
 					delete(blocksByAddr, addr)
 				}
 
-				oldSig := block.signature
+				if move == "priority_place" {
+					block.Version.SetS(c.seq)
+					slot := NewMvpSlot(c.seq)
+					slot.SetBlock(block)
+					populatedPath[position] = slot
 
-				block.signature = signature
-				block.Version.SetS(c.seq)
+					update := newPath(block.Addr, block.signature, position, positionMapVersion(block.Version, c.seq), c.seq)
+					appendPositionMapUpdate(populatedPathMap, update)
+				} else {
+					oldSig := block.signature
 
-				slot := NewMvpSlot(c.seq)
-				slot.SetBlock(block)
-				populatedPath[position] = slot
+					block.signature = signature
+					block.Version.SetS(c.seq)
 
-				update := newPath(block.Addr, block.signature, position, positionMapVersion(block.Version, c.seq), c.seq)
-				appendPositionMapUpdate(populatedPathMap, update)
+					slot := NewMvpSlot(c.seq)
+					slot.SetBlock(block)
+					populatedPath[position] = slot
 
-				if oldSig != block.signature {
-					deletePath := newPath(block.Addr, oldSig, mvpDeletePosition, positionMapVersion(block.Version, c.seq), c.seq)
-					appendPositionMapUpdate(populatedPathMap, deletePath)
+					update := newPath(block.Addr, block.signature, position, positionMapVersion(block.Version, c.seq), c.seq)
+					appendPositionMapUpdate(populatedPathMap, update)
+
+					if oldSig != block.signature {
+						deletePath := newPath(block.Addr, oldSig, mvpDeletePosition, positionMapVersion(block.Version, c.seq), c.seq)
+						appendPositionMapUpdate(populatedPathMap, deletePath)
+					}
 				}
-
-				logPopulateMove(c.seq, c.ClientID, move, block, c.PositionMap[block.Addr][block.signature].Slot, position)
 
 				evaluationResult[addr] += pathPatternCount(position, c.L)
 				placed++
@@ -1257,79 +1234,6 @@ func pathPatternCount(position MvpPosition, pathLen int) int {
 	}
 }
 
-func shouldLogMetrics(seq Version) bool {
-	if seq <= 100 {
-		return true
-	}
-	return mvpStashMetricsInterval > 0 && int(seq)%mvpStashMetricsInterval == 0
-}
-
-func shouldLogPopulateDetail(seq Version) bool {
-	return seq <= 10 && os.Getenv("RE_MVP_POPULATE_DETAIL") == "1"
-}
-
-func logPopulateMove(seq Version, clientID int, move string, block MvpDataBlock, from MvpPosition, to MvpPosition) {
-	if !shouldLogPopulateDetail(seq) {
-		return
-	}
-	log.Printf(
-		"populate detail: seq=%d client=%d move=%s addr=%d sig=%d from=%v to=%v ver=(V:%d A:%d S:%d)",
-		seq,
-		clientID,
-		move,
-		block.Addr,
-		block.signature,
-		from,
-		to,
-		block.Version.V,
-		block.Version.A,
-		block.Version.S,
-	)
-}
-
-func blockMapCount(blocksByAddr map[int][]MvpDataBlock) int {
-	count := 0
-	for _, blocks := range blocksByAddr {
-		count += len(blocks)
-	}
-	return count
-}
-
-func pathBlockCount(path map[MvpPosition]MvpSlot) int {
-	count := 0
-	for _, slot := range path {
-		if !slot.IsEmpty() {
-			count++
-		}
-	}
-	return count
-}
-
-func (c *MvpClient) logPopulateBreakdown(op OramOP, wAddr int, wBlocks int, priorityTotal int, priorityPlaced int, priorityStashed int, drainAddr int, drainBlocks int, drainPlaced int, unusedSlots int, populatedPath map[MvpPosition]MvpSlot, populatedStash []MvpDataBlock, populatedPathMap []path) {
-	if !shouldLogMetrics(c.seq) {
-		return
-	}
-	log.Printf(
-		"populate breakdown: seq=%d client=%d op=%s addr=%d W_addr=%d W_blocks=%d priority_total=%d priority_placed=%d priority_stashed=%d drain_addr=%d drain_blocks=%d drain_placed=%d unused_slots=%d final_path=%d final_stash=%d pathmap_updates=%d",
-		c.seq,
-		c.ClientID,
-		op.OP,
-		op.target,
-		wAddr,
-		wBlocks,
-		priorityTotal,
-		priorityPlaced,
-		priorityStashed,
-		drainAddr,
-		drainBlocks,
-		drainPlaced,
-		unusedSlots,
-		pathBlockCount(populatedPath),
-		len(populatedStash),
-		len(populatedPathMap),
-	)
-}
-
 func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig int) (map[MvpPosition]MvpSlot, []MvpDataBlock, []path) {
 
 	// Phase 1: prepare the path, stash, and position-map update outputs for this eviction.
@@ -1341,8 +1245,6 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 	unusedSlot := make([]MvpPosition, 0, c.L*c.Z)
 	usedSlot := make([]MvpPosition, 0, c.L*c.Z)
 
-	wAddrCount := len(W)
-	wBlockCount := blockMapCount(W)
 	prioritylist := make([]MvpDataBlock, 0)
 	drainlist := make(map[int][]MvpDataBlock, 0)
 	addrlist := make([]int, 0)
@@ -1406,7 +1308,6 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 		return prioritylist[i].Version.A > prioritylist[j].Version.A
 	})
 
-	priorityTotal := len(prioritylist)
 	// Phase 5: place priority blocks
 	priorityPlaced := 0
 	// path 上の bucket を走査し、各 bucket 内の固定 slot 0..Z-1 を順に出力対象として初期化する。
@@ -1514,7 +1415,6 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 		populatedPath[position] = slot
 		path := newPath(block.Addr, block.signature, position, positionMapVersion(block.Version, c.seq), c.seq)
 		appendPositionMapUpdate(&populatedPathMap, path)
-		logPopulateMove(c.seq, c.ClientID, "priority_place", block, c.PositionMap[block.Addr][block.signature].Slot, position)
 	}
 
 	priorityStashed := 0
@@ -1526,6 +1426,7 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 		}
 		var priorityPlacedByPattern int
 		unusedSlot, priorityPlacedByPattern = c.placePatternBlocks(priorityByAddr, unusedSlot, populatedPath, &populatedPathMap, "priority_place")
+
 		priorityPlaced += priorityPlacedByPattern
 
 		// 空き slot に置けなかった priority block をすべて新しい stash 出力へ移す。
@@ -1540,7 +1441,6 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 				block.Version.SetS(c.seq)
 				populatedStash = append(populatedStash, block)
 				appendPositionMapUpdate(&populatedPathMap, newPath(block.Addr, block.signature, mvpStashPosition, block.Version, c.seq))
-				logPopulateMove(c.seq, c.ClientID, "priority_stash", block, c.PositionMap[block.Addr][block.signature].Slot, mvpStashPosition)
 				priorityStashed++
 			}
 		}
@@ -1556,7 +1456,6 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 			block.Version.SetS(c.seq)
 			populatedStash = append(populatedStash, block)
 			appendPositionMapUpdate(&populatedPathMap, newPath(block.Addr, block.signature, mvpStashPosition, block.Version, c.seq))
-			logPopulateMove(c.seq, c.ClientID, "priority_stash", block, c.PositionMap[block.Addr][block.signature].Slot, mvpStashPosition)
 			priorityStashed++
 			stashedAddr[block.Addr] = true
 		}
@@ -1564,7 +1463,6 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 
 	// Phase 6: if no drain blocks exist, return the priority-only path and stash outputs.
 	if len(drainlist) == 0 {
-		c.logPopulateBreakdown(op, wAddrCount, wBlockCount, priorityTotal, priorityPlaced, priorityStashed, len(drainlist), blockMapCount(drainlist), 0, len(unusedSlot), populatedPath, populatedStash, populatedPathMap)
 		return populatedPath, populatedStash, populatedPathMap
 	}
 
@@ -1574,9 +1472,8 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 	for addr := range drainlist {
 		addrlist = append(addrlist, addr)
 	}
-	drainPlaced := 0
 	if len(unusedSlot) > 0 {
-		unusedSlot, drainPlaced = c.placePatternBlocks(drainlist, unusedSlot, populatedPath, &populatedPathMap, "drain_place")
+		unusedSlot, _ = c.placePatternBlocks(drainlist, unusedSlot, populatedPath, &populatedPathMap, "drain_place")
 	}
 
 	// Phase 9: delete the original drain signatures after their replacement/copy updates have been emitted.
@@ -1590,8 +1487,6 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 			}
 		}
 	}
-
-	c.logPopulateBreakdown(op, wAddrCount, wBlockCount, priorityTotal, priorityPlaced, priorityStashed, len(drainlist), blockMapCount(drainlist), drainPlaced, len(unusedSlot), populatedPath, populatedStash, populatedPathMap)
 
 	// 新しいpath、新しいstash、新しいPathMapを返す。
 	return populatedPath, populatedStash, populatedPathMap
