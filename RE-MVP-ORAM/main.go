@@ -31,8 +31,8 @@ func RunExperiment(runMode string, experimentMode string, accessType string, ora
 		defaultL                     = 12
 		seed                         = 542
 		clientCount                  = 50
-		readRatio                    = 0.8
-		zipfAlpha                    = 1.1
+		readRatio                    = 0.9
+		zipfAlpha                    = 1.5
 		stashMetricsSequenceInterval = Version(100)
 	)
 
@@ -170,7 +170,7 @@ func AsyncRun(
 }
 
 func initializeRun(z int, l int, seed int64) (*MvpServer, int, map[int]map[int]MvpPositionMapEntry) {
-	n := 1 << (l - 1)
+	n := 2 * (1 << (l - 2))
 	server := NewMvpServer(z, l)
 	positionmap := server.InitializeRandomData(n, seed)
 

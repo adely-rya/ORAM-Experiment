@@ -625,12 +625,6 @@ func (r EvictReques) handle(s *MvpServer) {
 	nowtree := s.tree.Tree
 	var oldtree map[MvpBucketPosition]MvpBucket
 	var oldstash map[int][]MvpDataBlock
-	outputVersions := make(map[pathKey]Versions, len(r.PathMap))
-	for _, path := range r.PathMap {
-		key := pathKey{addr: path.addr, sig: path.sig}
-		outputVersions[key] = path.Ver
-	}
-
 	oldstate := s.Snapshot[r.ClientID]
 	oldtree = oldstate.TreeState.Tree
 	oldstash = oldstate.StashState
@@ -993,6 +987,38 @@ func setWorkingBlock(W map[int][]MvpDataBlock, block MvpDataBlock) {
 	appendWorkingBlock(W, block)
 }
 
+func workingSetSignatures(blocks []MvpDataBlock) []int {
+	signatures := make([]int, 0, len(blocks))
+	for _, block := range blocks {
+		signatures = append(signatures, block.signature)
+	}
+	sort.Ints(signatures)
+	return signatures
+}
+
+func (c *MvpClient) debugRawTargetBlocks(addr int) []string {
+	found := make([]string, 0)
+	for stashVersion, stash := range c.Stash {
+		for _, block := range stash {
+			if block.Addr == addr {
+				found = append(found, fmt.Sprintf("stash[%d]:sig=%d ver=%+v", stashVersion, block.signature, block.Version))
+			}
+		}
+	}
+	for bucketPosition, bucket := range c.path {
+		for slotPosition, versionedSlots := range bucket.Slots {
+			for version, slot := range versionedSlots {
+				if slot.IsEmpty() || slot.Value.Addr != addr {
+					continue
+				}
+				found = append(found, fmt.Sprintf("path[%s,%d,%d]:sig=%d ver=%+v", bucketPosition, slotPosition, version, slot.Value.signature, slot.Value.Version))
+			}
+		}
+	}
+	sort.Strings(found)
+	return found
+}
+
 func newerVersions(left Versions, right Versions) bool {
 	if left.V != right.V {
 		return left.V > right.V
@@ -1018,6 +1044,9 @@ func newerPathUpdate(left path, right path) bool {
 }
 
 func newerPositionUpdate(update path, current MvpPositionMapEntry) bool {
+	if update.to == mvpDeletePosition {
+		return update.Seq > current.Ts.S
+	}
 	if update.Ver.V != current.Ts.V {
 		return update.Ver.V > current.Ts.V
 	}
@@ -1068,6 +1097,7 @@ func (c *MvpClient) evaluationPathpattern(addrlist []int, path_list []path) map[
 	return result
 }
 
+// buildPatternPlacementState prepares score and reusable-signature state for placing existing priority blocks.
 func (c *MvpClient) buildPatternPlacementState(blocksByAddr map[int][]MvpDataBlock, pathList []path) ([]int, map[int]int, map[int][]int) {
 	addrkey := make([]int, 0, len(blocksByAddr))
 	// 配置候補を持つアドレスだけを評価対象として集める。
@@ -1093,19 +1123,56 @@ func (c *MvpClient) buildPatternPlacementState(blocksByAddr map[int][]MvpDataBlo
 	return addrkey, evaluationResult, addrVSemptysig
 }
 
-func (c *MvpClient) oldplacePatternBlocks(
+// buildCopySourceByAddr picks one newest visible block per address as the source for future copy blocks.
+func buildCopySourceByAddr(W map[int][]MvpDataBlock) map[int]MvpDataBlock {
+	copySourceByAddr := make(map[int]MvpDataBlock, len(W))
+	for addr, blocks := range W {
+		for _, block := range blocks {
+			current, ok := copySourceByAddr[addr]
+			if !ok || newerVersions(block.Version, current.Version) {
+				copySourceByAddr[addr] = block
+			}
+		}
+	}
+	return copySourceByAddr
+}
+
+// buildCopyPlacementState computes address scores and reusable signatures for generated copy placement.
+func (c *MvpClient) buildCopyPlacementState(copySourceByAddr map[int]MvpDataBlock, pathList []path) ([]int, map[int]int, map[int][]int) {
+	addrkey := make([]int, 0, len(copySourceByAddr))
+	for addr := range copySourceByAddr {
+		addrkey = append(addrkey, addr)
+	}
+
+	evaluationResult := c.evaluationPathpattern(addrkey, pathList)
+	virtualPositionMap := clonePositionMap(c.PositionMap)
+	applyPathMapsToPositionMap(virtualPositionMap, pathList)
+
+	addrVSemptysig := make(map[int][]int, len(copySourceByAddr))
+	for _, addr := range addrkey {
+		for sig, position := range virtualPositionMap[addr] {
+			if position.Slot == mvpDeletePosition {
+				addrVSemptysig[addr] = append(addrVSemptysig[addr], sig)
+			}
+		}
+		sort.Ints(addrVSemptysig[addr])
+	}
+
+	return addrkey, evaluationResult, addrVSemptysig
+}
+
+// placePriorityBlocks places leftover priority blocks into empty path slots without changing signatures.
+func (c *MvpClient) placePriorityBlocks(
 	blocksByAddr map[int][]MvpDataBlock,
 	unusedSlot []MvpPosition,
 	populatedPath map[MvpPosition]MvpSlot,
 	populatedPathMap *[]path,
-	move string,
 ) ([]MvpPosition, int) {
 	if len(blocksByAddr) == 0 || len(unusedSlot) == 0 {
 		return unusedSlot, 0
 	}
 
-	//addrkeyは評価のキーのリスト
-	addrkey, evaluationResult, addrVSemptysig := c.buildPatternPlacementState(blocksByAddr, *populatedPathMap)
+	addrkey, evaluationResult, _ := c.buildPatternPlacementState(blocksByAddr, *populatedPathMap)
 	if len(addrkey) == 0 {
 		return unusedSlot, 0
 	}
@@ -1133,93 +1200,123 @@ func (c *MvpClient) oldplacePatternBlocks(
 		}
 
 		var (
-			signature      int
-			addr           int
-			foundSignature bool
+			addr       int
+			foundBlock bool
 		)
 
-		// 評価値の小さいアドレスから順に、再利用できる signature slot を持つアドレスを探す。
+		// 評価値の小さいアドレスから順に、残った priority block を空き slot へ置く。
 		for attempts := 0; attempts < len(addrkey); attempts++ {
 			addr = addrkey[index]
 
-			if move == "priority_place" || move == "drain_place" {
-				if len(blocksByAddr[addr]) == 0 { //置き換え可能なブロックが存在するのか？
-					index++
-					if index == len(addrkey) {
-						index = 0
-					}
-					continue
-				}
-
-				block := blocksByAddr[addr][0]
-				blocksByAddr[addr] = blocksByAddr[addr][1:]
-				block.Version.SetS(c.seq)
-				slot := NewMvpSlot(c.seq)
-				slot.SetBlock(block)
-				populatedPath[position] = slot
-				update := newPath(block.Addr, block.signature, position, positionMapVersion(block.Version, c.seq), c.seq)
-				appendPositionMapUpdate(populatedPathMap, update)
-			} else {
-				if len(addrVSemptysig[addr]) > 0 {
-					signature = addrVSemptysig[addr][0]
-				}
-			}
-
-			if len(addrVSemptysig[addr]) > 0 {
-				signature = addrVSemptysig[addr][0]
-				addrVSemptysig[addr] = addrVSemptysig[addr][1:]
-				block := blocksByAddr[addr][0]
-				blocksByAddr[addr] = blocksByAddr[addr][1:]
-				if len(blocksByAddr[addr]) == 0 {
-					delete(blocksByAddr, addr)
-				}
-
-				if move == "priority_place" {
-					block.Version.SetS(c.seq)
-					slot := NewMvpSlot(c.seq)
-					slot.SetBlock(block)
-					populatedPath[position] = slot
-
-					update := newPath(block.Addr, block.signature, position, positionMapVersion(block.Version, c.seq), c.seq)
-					appendPositionMapUpdate(populatedPathMap, update)
-				} else {
-					oldSig := block.signature
-
-					block.signature = signature
-					block.Version.SetS(c.seq)
-
-					slot := NewMvpSlot(c.seq)
-					slot.SetBlock(block)
-					populatedPath[position] = slot
-
-					update := newPath(block.Addr, block.signature, position, positionMapVersion(block.Version, c.seq), c.seq)
-					appendPositionMapUpdate(populatedPathMap, update)
-
-					if oldSig != block.signature {
-						deletePath := newPath(block.Addr, oldSig, mvpDeletePosition, positionMapVersion(block.Version, c.seq), c.seq)
-						appendPositionMapUpdate(populatedPathMap, deletePath)
-					}
-				}
-
-				evaluationResult[addr] += pathPatternCount(position, c.L)
-				placed++
+			if len(blocksByAddr[addr]) == 0 {
 				index++
-				foundSignature = true
-				break
+				if index == len(addrkey) {
+					index = 0
+				}
+				continue
 			}
+
+			block := blocksByAddr[addr][0]
+			blocksByAddr[addr] = blocksByAddr[addr][1:]
+			if len(blocksByAddr[addr]) == 0 {
+				delete(blocksByAddr, addr)
+			}
+
+			block.Version.SetS(c.seq)
+			slot := NewMvpSlot(c.seq)
+			slot.SetBlock(block)
+			populatedPath[position] = slot
+
+			update := newPath(block.Addr, block.signature, position, positionMapVersion(block.Version, c.seq), c.seq)
+			appendPositionMapUpdate(populatedPathMap, update)
+
+			evaluationResult[addr] += pathPatternCount(position, c.L)
+			placed++
 			index++
-			if index == len(addrkey) {
-				index = 0
-			}
+			foundBlock = true
+			break
 		}
 
-		if !foundSignature {
+		if !foundBlock {
 			remainingUnused = append(remainingUnused, unusedSlot[unusedIndex:]...)
 			break
 		}
 	}
 
 	return remainingUnused, placed
+}
+
+// placeCopyBlocks fills remaining empty path slots with newly generated copies using deleted signatures.
+func (c *MvpClient) placeCopyBlocks(
+	copySourceByAddr map[int]MvpDataBlock,
+	unusedSlot []MvpPosition,
+	populatedPath map[MvpPosition]MvpSlot,
+	populatedPathMap *[]path,
+) []MvpPosition {
+	if len(copySourceByAddr) == 0 || len(unusedSlot) == 0 {
+		return unusedSlot
+	}
+
+	addrkey, evaluationResult, addrVSemptysig := c.buildCopyPlacementState(copySourceByAddr, *populatedPathMap)
+	if len(addrkey) == 0 {
+		return unusedSlot
+	}
+
+	index := len(addrkey)
+	remainingUnused := make([]MvpPosition, 0, len(unusedSlot))
+
+	// unusedSlot を前から埋め、addrkey を一周するたびに評価値の小さい順へ並び替える。
+	for unusedIndex, position := range unusedSlot {
+		if index == len(addrkey) {
+			sort.Slice(addrkey, func(i, j int) bool {
+				left := evaluationResult[addrkey[i]]
+				right := evaluationResult[addrkey[j]]
+				if left != right {
+					return left < right
+				}
+				return addrkey[i] < addrkey[j]
+			})
+			index = 0
+		}
+
+		placed := false
+		for attempts := 0; attempts < len(addrkey); attempts++ {
+			addr := addrkey[index]
+			if len(addrVSemptysig[addr]) == 0 {
+				index++
+				if index == len(addrkey) {
+					index = 0
+				}
+				continue
+			}
+
+			signature := addrVSemptysig[addr][0]
+			addrVSemptysig[addr] = addrVSemptysig[addr][1:]
+
+			block := copySourceByAddr[addr]
+			block.signature = signature
+			block.Version.SetS(c.seq)
+
+			slot := NewMvpSlot(c.seq)
+			slot.SetBlock(block)
+			populatedPath[position] = slot
+
+			update := newPath(block.Addr, block.signature, position, positionMapVersion(block.Version, c.seq), c.seq)
+			appendPositionMapUpdate(populatedPathMap, update)
+
+			evaluationResult[addr] += pathPatternCount(position, c.L)
+			index++
+			placed = true
+			break
+		}
+
+		if !placed {
+			remainingUnused = append(remainingUnused, unusedSlot[unusedIndex:]...)
+			break
+		}
+	}
+
+	return remainingUnused
 }
 
 func applyPathMapsToPositionMap(positionMap map[int]map[int]MvpPositionMapEntry, pathMaps []path) {
@@ -1245,6 +1342,7 @@ func pathPatternCount(position MvpPosition, pathLen int) int {
 	}
 }
 
+// populatePath writes priority blocks first, then creates fresh copy blocks from one source block per address.
 func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig int) (map[MvpPosition]MvpSlot, []MvpDataBlock, []path) {
 
 	// Phase 1: prepare the path, stash, and position-map update outputs for this eviction.
@@ -1257,8 +1355,6 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 	usedSlot := make([]MvpPosition, 0, c.L*c.Z)
 
 	prioritylist := make([]MvpDataBlock, 0)
-	drainlist := make(map[int][]MvpDataBlock, 0)
-	addrlist := make([]int, 0)
 
 	// Phase 3: locate and update the accessed target block before splitting W.
 
@@ -1276,7 +1372,11 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 		targetBlock.Version.SetA(c.seq) //バージョンAを更新
 		setWorkingBlock(W, targetBlock)
 	} else {
-		log.Panicln("No target block in Workingset")
+		entry, ok := c.PositionMap[op.target][targetSig]
+		if !ok {
+			log.Panicf("No target block in Workingset: client=%d seq=%d op=%s addr=%d sig=%d pm=missing w_sigs=%v", c.ClientID, c.seq, op.OP, op.target, targetSig, workingSetSignatures(W[op.target]))
+		}
+		log.Panicf("No target block in Workingset: client=%d seq=%d op=%s addr=%d sig=%d pm_slot=%v pm_ts=%+v w_sigs=%v raw=%v", c.ClientID, c.seq, op.OP, op.target, targetSig, entry.Slot, entry.Ts, workingSetSignatures(W[op.target]), c.debugRawTargetBlocks(op.target))
 	}
 
 	if op.OP == Write {
@@ -1288,7 +1388,7 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 			}
 
 			if entry.Slot == mvpDeletePosition {
-				continue
+				//continue
 			}
 			path := newPath(op.target, sig, mvpDeletePosition, Versions{V: c.seq, A: c.seq, S: c.seq}, c.seq)
 			appendPositionMapUpdate(&populatedPathMap, path)
@@ -1298,20 +1398,22 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 		prioritylist = append(prioritylist, targetBlock)
 	}
 
-	// Phase 4: split W into high-priority blocks placed first and drain blocks used to fill remaining slots.
+	// Phase 4: keep one copy source per address and delete all old non-priority copies immediately.
+	copySourceByAddr := buildCopySourceByAddr(W)
 
-	// W の各アドレスを走査し、sig0 だけを prioritylist、sig0 以外をすべて drainlist に分ける。
-	for addr, blocks := range W {
-		addrlist = append(addrlist, addr)
+	// W の各アドレスを走査し、sig0 とアクセス対象 copy だけを prioritylist に残す。
+	for _, blocks := range W {
 		// 同一アドレスの全ブロックを確認し、signature が 0 なら本体、非 0 ならコピーとして扱う。
 		for _, block := range blocks {
 			if block.signature == 0 || block == targetBlock {
+
 				prioritylist = append(prioritylist, block)
 				continue
 			}
 
-			// sig0 以外はアクセス対象だった read copy も含めて必ず drain に回し、priority 配置から外す。
-			drainlist[addr] = append(drainlist[addr], block)
+			// 既存 copy は移動せず削除し、後段で copySourceByAddr から新しい copy として作り直す。
+			deletePath := newPath(block.Addr, block.signature, mvpDeletePosition, Versions{V: block.Version.V, A: block.Version.A, S: c.seq}, c.seq)
+			appendPositionMapUpdate(&populatedPathMap, deletePath)
 		}
 	}
 
@@ -1320,7 +1422,6 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 	})
 
 	// Phase 5: place priority blocks
-	priorityPlaced := 0
 	// path 上の bucket を走査し、各 bucket 内の固定 slot 0..Z-1 を順に出力対象として初期化する。
 	for bucketPosition := range c.path {
 		// この bucket の全物理 slot を確認し、priority block の旧 position と一致する slot だけを一時配置に使う。
@@ -1357,7 +1458,6 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 				}
 			}
 			prioritylist = append(prioritylist[:selectedIndex], prioritylist[selectedIndex+1:]...)
-			priorityPlaced++
 			block.Version.SetS(c.seq)
 
 			slot := NewMvpSlot(c.seq)
@@ -1428,17 +1528,13 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 		appendPositionMapUpdate(&populatedPathMap, path)
 	}
 
-	priorityStashed := 0
 	if len(prioritylist) > 0 && len(unusedSlot) > 0 {
 		priorityByAddr := make(map[int][]MvpDataBlock, len(prioritylist))
 		// exact slot に戻せなかった priority block をアドレス別にまとめ、空き slot への copy 配置に回す。
 		for _, block := range prioritylist {
 			priorityByAddr[block.Addr] = append(priorityByAddr[block.Addr], block)
 		}
-		var priorityPlacedByPattern int
-		unusedSlot, priorityPlacedByPattern = c.placePatternBlocks(priorityByAddr, unusedSlot, populatedPath, &populatedPathMap, "priority_place")
-
-		priorityPlaced += priorityPlacedByPattern
+		unusedSlot, _ = c.placePriorityBlocks(priorityByAddr, unusedSlot, populatedPath, &populatedPathMap)
 
 		// 空き slot に置けなかった priority block をすべて新しい stash 出力へ移す。
 		for _, blocks := range priorityByAddr {
@@ -1452,7 +1548,6 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 				block.Version.SetS(c.seq)
 				populatedStash = append(populatedStash, block)
 				appendPositionMapUpdate(&populatedPathMap, newPath(block.Addr, block.signature, mvpStashPosition, block.Version, c.seq))
-				priorityStashed++
 			}
 		}
 	} else if len(prioritylist) > 0 {
@@ -1467,36 +1562,13 @@ func (c *MvpClient) populatePath(W map[int][]MvpDataBlock, op OramOP, targetSig 
 			block.Version.SetS(c.seq)
 			populatedStash = append(populatedStash, block)
 			appendPositionMapUpdate(&populatedPathMap, newPath(block.Addr, block.signature, mvpStashPosition, block.Version, c.seq))
-			priorityStashed++
 			stashedAddr[block.Addr] = true
 		}
 	}
 
-	// Phase 6: if no drain blocks exist, return the priority-only path and stash outputs.
-	if len(drainlist) == 0 {
-		return populatedPath, populatedStash, populatedPathMap
-	}
-
-	// Phase 7: compute tentative PositionMap state and available signatures for drain placement.
-	addrlist = addrlist[:0]
-	// drain 対象アドレスだけを集め直し、以降の配置評価対象を priority 処理後の残りに絞る。
-	for addr := range drainlist {
-		addrlist = append(addrlist, addr)
-	}
+	// Phase 6: fill any remaining empty slots with newly generated copies using unused signatures.
 	if len(unusedSlot) > 0 {
-		unusedSlot, _ = c.placePatternBlocks(drainlist, unusedSlot, populatedPath, &populatedPathMap, "drain_place")
-	}
-
-	// Phase 9: delete the original drain signatures after their replacement/copy updates have been emitted.
-	if len(drainlist) > 0 {
-		// drain 配置で新 signature を発行したあと、元 signature を Delete に更新する。
-		for addr, blocks := range drainlist {
-			// 同じアドレスに残った古い block signature を順に Delete へ倒す。
-			for _, block := range blocks {
-				path := newPath(addr, block.signature, mvpDeletePosition, Versions{V: block.Version.V, A: block.Version.A, S: c.seq}, c.seq)
-				appendPositionMapUpdate(&populatedPathMap, path)
-			}
-		}
+		unusedSlot = c.placeCopyBlocks(copySourceByAddr, unusedSlot, populatedPath, &populatedPathMap)
 	}
 
 	// 新しいpath、新しいstash、新しいPathMapを返す。

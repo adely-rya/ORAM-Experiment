@@ -120,12 +120,12 @@ func RunStatisticalDistanceExperiment(oramType string, accessType string) {
 func readStatisticalDistanceConfig(oramType string, accessType string) statisticalDistanceConfig {
 	const (
 		defaultZ            = 4
-		defaultL            = 10
-		defaultClientCount  = 40
-		defaultWarmupRounds = 300
-		defaultTrials       = 200000
+		defaultL            = 9
+		defaultClientCount  = 20
+		defaultWarmupRounds = 30
+		defaultTrials       = 400
 		defaultSeed         = 542
-		defaultReadRatio    = 0.5
+		defaultReadRatio    = 0.9
 		defaultZipfAlpha    = 1.1
 	)
 
@@ -135,7 +135,7 @@ func readStatisticalDistanceConfig(oramType string, accessType string) statistic
 		accessType:   normalizeStatisticalDistanceAccessType(accessType),
 		z:            readStatisticalDistancePositiveIntEnv("RE_MVP_STAT_DISTANCE_Z", defaultZ),
 		l:            l,
-		addrCount:    readStatisticalDistancePositiveIntEnv("RE_MVP_STAT_DISTANCE_ADDR_COUNT", 1<<(l-1)),
+		addrCount:    readStatisticalDistancePositiveIntEnv("RE_MVP_STAT_DISTANCE_ADDR_COUNT", 2*(1<<(l-2))),
 		clientCount:  readStatisticalDistancePositiveIntEnv("RE_MVP_STAT_DISTANCE_CLIENT_COUNT", defaultClientCount),
 		warmupRounds: readStatisticalDistancePositiveIntEnv("RE_MVP_STAT_DISTANCE_WARMUP_ROUNDS", defaultWarmupRounds),
 		trials:       readStatisticalDistancePositiveIntEnv("RE_MVP_STAT_DISTANCE_TRIALS", defaultTrials),
@@ -336,7 +336,8 @@ func chooseReMvpStatisticalDistanceTargetLeaf(client *MvpClient, addr int, op st
 		return 0, MvpPosition{}, false
 	}
 
-	intervals := make([]statisticalDistanceLeafInterval, 0, len(signatures))
+	candidates := make(map[MvpPosition]int, 1<<client.L)
+	positions := make([]MvpPosition, 0, 1<<client.L)
 	for _, sig := range signatures {
 		bucketPosition := entries[sig].Slot.bucket
 		if entries[sig].Slot == mvpStashPosition || bucketPosition == mvpStashBucketPosition || bucketPosition == mvpRootBucketPosition {
@@ -347,14 +348,30 @@ func chooseReMvpStatisticalDistanceTargetLeaf(client *MvpClient, addr int, op st
 		if len(prefix) > client.L {
 			prefix = ""
 		}
-		intervals = append(intervals, statisticalDistancePrefixInterval(prefix, client.L))
+
+		remainingDepth := client.L - len(prefix)
+		for leafIndex := 0; leafIndex < 1<<remainingDepth; leafIndex++ {
+			leaf := ""
+			if remainingDepth > 0 {
+				leaf = strconv.FormatInt(int64(leafIndex), 2)
+				for len(leaf) < remainingDepth {
+					leaf = "0" + leaf
+				}
+			}
+			position := MvpPosition{bucket: MvpBucketPosition(prefix + leaf)}
+			if _, ok := candidates[position]; ok {
+				continue
+			}
+			candidates[position] = sig
+			positions = append(positions, position)
+		}
 	}
-	merged := mergeStatisticalDistanceLeafIntervals(intervals)
-	if len(merged) == 0 {
+	if len(positions) == 0 {
 		return 0, MvpPosition{}, false
 	}
 
-	return 0, statisticalDistanceSampleLeafFromIntervals(merged, client.L, rng), true
+	position := positions[rng.Intn(len(positions))]
+	return candidates[position], position, true
 }
 
 // recordReMvpStatisticalDistanceAccessStats は RE-MVP-ORAM の現在の position map から active sig 数と候補 leaf 数を集計する。
